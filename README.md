@@ -53,8 +53,8 @@ You'll need these installed on your machine:
 
 ### 1. Grab the Code
 ```bash
-git clone https://gitlab.com/s_shaik_ultimate_group/ssos.git
-cd ssos
+git clone https://gitlab.com/gitlab-com/support/toolbox/soslab.git
+cd soslab
 ```
 
 ### 2. One Command to Start Everything
