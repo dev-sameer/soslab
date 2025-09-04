@@ -1,0 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+
+# Node.js / Frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+*.log
+
+# Data and User Files
+backend/data/uploads/
+backend/data/extracted/
+backend/data/conversations/
+backend/data/sessions/
+
+# Reports (but you might want to keep some as examples)
+backend/autogrep_report_*.json
+*.tar
+*.tar.gz
+*.zip
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment files
+.env
+.env.local
+.env.production.local
+.env.development.local
+.env.test.local
+
+# Build outputs
+frontend/dist/
+frontend/build/
+
+# Keep bin directory (contains necessary binaries)
+# !backend/bin/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Coverage
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+.Trash-*backend/data/reports/*.json
+backend/data/
+
+
+
