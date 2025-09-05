@@ -352,7 +352,7 @@ class SmartRunner:
                 if proc.poll() is None:
                     proc.terminate()
             print("✅ All services stopped")
-            print("\n💡 To restart: python run.py")
+            print("\n💡 To restart: python start.py")
             sys.exit(0)
         
         signal.signal(signal.SIGINT, shutdown)
