@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { 
     Search, Upload, FileText, AlertCircle, CheckCircle, Trash2,
     Download, Filter, ChevronRight, ChevronDown, Activity, Package,
@@ -873,16 +873,98 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
     const [selectedFile, setSelectedFile] = useState(initialFile);
     const [fileContent, setFileContent] = useState(null);
     const [loading, setLoading] = useState(false);
-    const [searchTerm, setSearchTerm] = useState('');
+    const [searchQuery, setSearchQuery] = useState('');
     const [currentLine, setCurrentLine] = useState(initialLine || 1);
     const lineRefs = useRef({});
-    const [displayLimit, setDisplayLimit] = useState(10000); // Show 10000 lines at a time
-    
+    const [displayLimit, setDisplayLimit] = useState(10000);
+    const [fileSearchTerm, setFileSearchTerm] = useState('');
+
+    // NEW: Performance-optimized filtering
+    const [parsedLines, setParsedLines] = useState([]); // Pre-parsed JSON lines
+    const [availableFields, setAvailableFields] = useState({}); // All detected fields with sample values
+    const [showFieldHelper, setShowFieldHelper] = useState(false);
+    const [isJsonFile, setIsJsonFile] = useState(false);
+    const [filterStats, setFilterStats] = useState({ total: 0, filtered: 0 });
+
+    // Filter fileList based on search
     const fileList = Object.entries(analysisData?.log_files || {}).map(([path, info]) => ({
         path,
         name: path.split('/').pop(),
         ...info
-    }));
+    })).filter(file => {
+        if (fileSearchTerm) {
+            const searchLower = fileSearchTerm.toLowerCase();
+            return file.path.toLowerCase().includes(searchLower) ||
+                file.name.toLowerCase().includes(searchLower);
+        }
+        return true;
+    });
+
+    // Parse and cache JSON lines for performance
+    useEffect(() => {
+        if (!fileContent?.content) return;
+
+        const parsed = [];
+        const fields = {};
+        let jsonCount = 0;
+
+        // Parse all lines once
+        fileContent.content.forEach((line, index) => {
+            let lineData = {
+                raw: line,
+                parsed: null,
+                index: index
+            };
+
+            if (typeof line === 'string' && line.trim().startsWith('{')) {
+                try {
+                    const json = JSON.parse(line);
+                    lineData.parsed = json;
+                    jsonCount++;
+
+                    // Collect field information
+                    Object.entries(json).forEach(([key, value]) => {
+                        if (!fields[key]) {
+                            fields[key] = {
+                                type: typeof value,
+                                sampleValues: new Set(),
+                                count: 0
+                            };
+                        }
+                        fields[key].count++;
+
+                        // Collect sample values for useful fields
+                        if (value !== null && value !== undefined && value !== '') {
+                            const valueStr = String(value);
+                            if (valueStr.length < 100) { // Don't collect huge values
+                                fields[key].sampleValues.add(valueStr);
+                            }
+                        }
+                    });
+                } catch (e) {
+                    // Not valid JSON
+                }
+            }
+
+            parsed.push(lineData);
+        });
+
+        // Convert sets to arrays and limit samples
+        Object.keys(fields).forEach(key => {
+            fields[key].sampleValues = Array.from(fields[key].sampleValues)
+                .slice(0, 20) // Keep only first 20 samples
+                .filter(v => v && v !== 'null' && v !== 'undefined'); // Filter out junk
+        });
+
+        setParsedLines(parsed);
+        setAvailableFields(fields);
+        setIsJsonFile(jsonCount > parsed.length * 0.3); // >30% JSON
+
+        // Auto-show field helper for JSON files
+        if (jsonCount > parsed.length * 0.3 && Object.keys(fields).length > 0) {
+            setShowFieldHelper(true);
+        }
+    }, [fileContent]);
 
     useEffect(() => {
         if (initialFile && initialFile !== selectedFile) {
@@ -902,12 +984,12 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
 
     useEffect(() => {
         if (!selectedFile || !sessionId) return;
-        
+
         const loadFileContent = async () => {
             setLoading(true);
-            setDisplayLimit(10000); // Reset display limit to 10k
+            setDisplayLimit(10000);
+            setSearchQuery(''); // Reset search on file change
             try {
-                // Just load the file normally - the browser can handle it
                 const response = await fetch(`/api/logs/${sessionId}/${selectedFile}`);
                 const data = await response.json();
                 setFileContent(data);
@@ -917,7 +999,7 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                 setLoading(false);
             }
         };
-        
+
         loadFileContent();
     }, [selectedFile, sessionId, analysisData]);
 
@@ -930,11 +1012,127 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
         return 'default';
     };
 
-    const filteredContent = fileContent?.content?.filter(line => 
-        !searchTerm || line.toLowerCase().includes(searchTerm.toLowerCase())
-    ) || [];
+    // Parse search query with boolean logic
+    const parseSearchQuery = (query) => {
+        if (!query.trim()) return null;
 
-    // Only display limited lines to prevent freezing
+        // Handle OR logic
+        if (query.includes(' OR ')) {
+            const parts = query.split(' OR ');
+            return {
+                type: 'OR',
+                conditions: parts.map(p => parseSearchQuery(p.trim())).filter(Boolean)
+            };
+        }
+
+        // Handle AND logic (default)
+        if (query.includes(' AND ')) {
+            const parts = query.split(' AND ');
+            return {
+                type: 'AND',
+                conditions: parts.map(p => parseSearchQuery(p.trim())).filter(Boolean)
+            };
+        }
+
+        // Handle NOT
+        if (query.startsWith('NOT ')) {
+            return {
+                type: 'NOT',
+                condition: parseSearchQuery(query.substring(4).trim())
+            };
+        }
+
+        // Handle field:value or field:>value patterns
+        if (query.includes(':')) {
+            const match = query.match(/^([^:]+):(.+)$/);
+            if (match) {
+                const [_, field, value] = match;
+
+                // Check for operators
+                if (value.startsWith('>=')) {
+                    return { type: 'FIELD_GTE', field: field.trim(), value: value.substring(2).trim() };
+                } else if (value.startsWith('>')) {
+                    return { type: 'FIELD_GT', field: field.trim(), value: value.substring(1).trim() };
+                } else if (value.startsWith('<=')) {
+                    return { type: 'FIELD_LTE', field: field.trim(), value: value.substring(2).trim() };
+                } else if (value.startsWith('<')) {
+                    return { type: 'FIELD_LT', field: field.trim(), value: value.substring(1).trim() };
+                } else if (value.startsWith('!=')) {
+                    return { type: 'FIELD_NEQ', field: field.trim(), value: value.substring(2).trim() };
+                } else {
+                    return { type: 'FIELD_EQ', field: field.trim(), value: value.trim() };
+                }
+            }
+        }
+
+        // Plain text search
+        return { type: 'TEXT', value: query };
+    };
+
+    // Evaluate parsed query against a line
+    const evaluateQuery = (query, lineData) => {
+        if (!query) return true;
+
+        switch (query.type) {
+            case 'OR':
+                return query.conditions.some(c => evaluateQuery(c, lineData));
+
+            case 'AND':
+                return query.conditions.every(c => evaluateQuery(c, lineData));
+
+            case 'NOT':
+                return !evaluateQuery(query.condition, lineData);
+
+            case 'TEXT':
+                return lineData.raw.toLowerCase().includes(query.value.toLowerCase());
+
+            case 'FIELD_EQ':
+                if (!lineData.parsed) return false;
+                const eqValue = String(lineData.parsed[query.field] || '').toLowerCase();
+                return eqValue === query.value.toLowerCase();
+
+            case 'FIELD_NEQ':
+                if (!lineData.parsed) return false;
+                const neqValue = String(lineData.parsed[query.field] || '').toLowerCase();
+                return neqValue !== query.value.toLowerCase();
+
+            case 'FIELD_GT':
+                if (!lineData.parsed) return false;
+                return Number(lineData.parsed[query.field]) > Number(query.value);
+
+            case 'FIELD_GTE':
+                if (!lineData.parsed) return false;
+                return Number(lineData.parsed[query.field]) >= Number(query.value);
+
+            case 'FIELD_LT':
+                if (!lineData.parsed) return false;
+                return Number(lineData.parsed[query.field]) < Number(query.value);
+
+            case 'FIELD_LTE':
+                if (!lineData.parsed) return false;
+                return Number(lineData.parsed[query.field]) <= Number(query.value);
+
+            default:
+                return true;
+        }
+    };
+
+    // Filter content with memoization
+    const filteredContent = useMemo(() => {
+        if (!parsedLines.length) return [];
+
+        const query = parseSearchQuery(searchQuery);
+
+        if (!query) {
+            setFilterStats({ total: parsedLines.length, filtered: parsedLines.length });
+            return parsedLines;
+        }
+
+        const filtered = parsedLines.filter(lineData => evaluateQuery(query, lineData));
+        setFilterStats({ total: parsedLines.length, filtered: filtered.length });
+        return filtered;
+    }, [parsedLines, searchQuery]);
+
     const displayedContent = filteredContent.slice(0, displayLimit);
     const hasMore = filteredContent.length > displayLimit;
 
@@ -942,61 +1140,133 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
         setDisplayLimit(prev => prev + 10000);
     };
 
+    // Insert field:value syntax into search
+    const insertFieldFilter = (field, value, operator = '') => {
+        const filterText = operator ? `${field}:${operator}${value}` : `${field}:${value}`;
+
+        if (searchQuery) {
+            // Add with AND
+            setSearchQuery(`${searchQuery} AND ${filterText}`);
+        } else {
+            setSearchQuery(filterText);
+        }
+    };
+
+    // Generate example queries based on detected fields
+    const getExampleQueries = () => {
+        const examples = [];
+
+        if (availableFields.severity || availableFields.level) {
+            examples.push('severity:error OR severity:fatal');
+        }
+        if (availableFields.status) {
+            examples.push('status:>=500');
+            examples.push('status:404 OR status:403');
+        }
+        if (availableFields.method) {
+            examples.push('method:POST AND status:>=400');
+        }
+        if (availableFields.duration_s) {
+            examples.push('duration_s:>1');
+        }
+        examples.push('NOT level:debug');
+        examples.push('error AND NOT "connection reset"');
+
+        return examples.slice(0, 4); // Return max 4 examples
+    };
+
     return (
         <div className="h-full flex" style={{ background: 'var(--bg-primary)' }}>
-            <div className="w-80 flex flex-col" style={{ 
-                background: 'var(--bg-secondary)', 
-                borderRight: '1px solid var(--border-primary)' 
+            <div className="w-80 flex flex-col" style={{
+                background: 'var(--bg-secondary)',
+                borderRight: '1px solid var(--border-primary)'
             }}>
                 <div className="p-4" style={{ borderBottom: '1px solid var(--border-primary)' }}>
                     <h3 className="font-bold" style={{ color: 'var(--text-primary)' }}>Log Files</h3>
-                    <p className="text-sm mt-1" style={{ color: 'var(--text-secondary)' }}>{fileList.length} files found</p>
+                    <p className="text-sm mt-1" style={{ color: 'var(--text-secondary)' }}>
+                        {fileList.length} {fileSearchTerm ? `of ${Object.keys(analysisData?.log_files || {}).length}` : ''} files found
+                    </p>
+
+                    <div className="mt-3">
+                        <div className="relative">
+                            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4"
+                                style={{ color: 'var(--text-tertiary)' }} />
+                            <input
+                                type="text"
+                                placeholder="Search files..."
+                                value={fileSearchTerm}
+                                onChange={(e) => setFileSearchTerm(e.target.value)}
+                                className="w-full pl-10 pr-8 py-2 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-current"
+                                style={{
+                                    background: 'var(--bg-primary)',
+                                    border: '1px solid var(--border-primary)',
+                                    color: 'var(--text-primary)'
+                                }}
+                            />
+                            {fileSearchTerm && (
+                                <button
+                                    onClick={() => setFileSearchTerm('')}
+                                    className="absolute right-2 top-1/2 transform -translate-y-1/2 p-1 rounded hover:bg-gray-600/20"
+                                    title="Clear search"
+                                >
+                                    <X className="w-3 h-3" style={{ color: 'var(--text-tertiary)' }} />
+                                </button>
+                            )}
+                        </div>
+                    </div>
                 </div>
-                
+
                 <div className="flex-1 overflow-y-auto">
-                    {fileList.map((file) => (
-                        <div
-                            key={file.path}
-                            className={`px-4 py-3 cursor-pointer text-sm flex items-center smooth-transition ${
-                                selectedFile === file.path 
-                                    ? 'btn-primary' 
+                    {fileList.length > 0 ? (
+                        fileList.map((file) => (
+                            <div
+                                key={file.path}
+                                className={`px-4 py-3 cursor-pointer text-sm flex items-center smooth-transition ${selectedFile === file.path
+                                    ? 'btn-primary'
                                     : ''
-                            }`}
-                            style={{
-                                background: selectedFile === file.path ? 'var(--accent)' : 'transparent',
-                                color: selectedFile === file.path ? 'var(--bg-primary)' : 'var(--text-primary)',
-                                ':hover': { background: 'var(--hover-bg)' }
-                            }}
-                            onClick={() => {
-                                setSelectedFile(file.path);
-                                setCurrentLine(1);
-                            }}
-                            onMouseEnter={(e) => selectedFile !== file.path && (e.currentTarget.style.background = 'var(--hover-bg)')}
-                            onMouseLeave={(e) => selectedFile !== file.path && (e.currentTarget.style.background = 'transparent')}
-                        >
-                            <FileText className="w-4 h-4 mr-3 flex-shrink-0" />
-                            <div className="flex-1 min-w-0">
-                                <div className="truncate font-medium">{file.name}</div>
-                                <div className="text-xs opacity-70 mt-1">
-                                    {file.lines?.toLocaleString()} lines • {file.service}
-                                    {file.size > 10 * 1024 * 1024 && (
-                                        <span className="ml-2 text-blue-500" title="Large file - optimized loading">⚡</span>
-                                    )}
+                                    }`}
+                                style={{
+                                    background: selectedFile === file.path ? 'var(--accent)' : 'transparent',
+                                    color: selectedFile === file.path ? 'var(--bg-primary)' : 'var(--text-primary)',
+                                    ':hover': { background: 'var(--hover-bg)' }
+                                }}
+                                onClick={() => {
+                                    setSelectedFile(file.path);
+                                    setCurrentLine(1);
+                                }}
+                                onMouseEnter={(e) => selectedFile !== file.path && (e.currentTarget.style.background = 'var(--hover-bg)')}
+                                onMouseLeave={(e) => selectedFile !== file.path && (e.currentTarget.style.background = 'transparent')}
+                            >
+                                <FileText className="w-4 h-4 mr-3 flex-shrink-0" />
+                                <div className="flex-1 min-w-0">
+                                    <div className="truncate font-medium">{file.name}</div>
+                                    <div className="text-xs opacity-70 mt-1">
+                                        {file.lines?.toLocaleString()} lines • {file.service}
+                                        {file.size > 10 * 1024 * 1024 && (
+                                            <span className="ml-2 text-blue-500" title="Large file - optimized loading">⚡</span>
+                                        )}
+                                    </div>
                                 </div>
                             </div>
+                        ))
+                    ) : (
+                        <div className="p-4 text-center" style={{ color: 'var(--text-tertiary)' }}>
+                            <p className="text-sm">
+                                {fileSearchTerm ? `No files match "${fileSearchTerm}"` : 'No files found'}
+                            </p>
                         </div>
-                    ))}
+                    )}
                 </div>
             </div>
 
             <div className="flex-1 flex flex-col">
                 {selectedFile ? (
                     <>
-                        <div className="p-4" style={{ 
-                            background: 'var(--bg-secondary)', 
-                            borderBottom: '1px solid var(--border-primary)' 
+                        <div className="p-4" style={{
+                            background: 'var(--bg-secondary)',
+                            borderBottom: '1px solid var(--border-primary)'
                         }}>
-                            <div className="flex items-center justify-between mb-4">
+                            <div className="flex items-center justify-between mb-3">
                                 <div>
                                     <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
                                         {selectedFile.split('/').pop()}
@@ -1005,7 +1275,12 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                                 </div>
                                 <div className="flex items-center gap-4">
                                     <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                                        Showing {displayedContent.length} of {fileContent?.total_lines || filteredContent.length} lines
+                                        {filterStats.filtered !== filterStats.total && (
+                                            <span style={{ color: '#f59e0b' }}>
+                                                {filterStats.filtered.toLocaleString()} filtered /
+                                            </span>
+                                        )}
+                                        {' '}{filterStats.total.toLocaleString()} total
                                     </span>
                                     <button
                                         onClick={() => {
@@ -1013,7 +1288,7 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                                             window.open(url, '_blank');
                                         }}
                                         className="p-2 rounded-xl smooth-transition"
-                                        style={{ 
+                                        style={{
                                             color: 'var(--text-secondary)',
                                             ':hover': { background: 'var(--hover-bg)' }
                                         }}
@@ -1023,23 +1298,136 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                                     </button>
                                 </div>
                             </div>
-                            <div className="relative">
-                                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5" style={{ color: 'var(--text-tertiary)' }} />
-                                <input
-                                    type="text"
-                                    placeholder="Search in loaded content..."
-                                    value={searchTerm}
-                                    onChange={(e) => setSearchTerm(e.target.value)}
-                                    className="w-full pl-10 pr-4 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-current smooth-transition"
-                                    style={{
-                                        background: 'var(--bg-primary)',
-                                        border: '1px solid var(--border-primary)',
-                                        color: 'var(--text-primary)'
-                                    }}
-                                />
+
+                            {/* Advanced search bar */}
+                            <div className="space-y-2">
+                                <div className="flex gap-2">
+                                    <div className="flex-1 relative">
+                                        <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5" style={{ color: 'var(--text-tertiary)' }} />
+                                        <input
+                                            type="text"
+                                            placeholder={isJsonFile
+                                                ? "Search with boolean: field:value AND/OR/NOT (e.g., status:>=500 AND method:POST)"
+                                                : "Search in file..."}
+                                            value={searchQuery}
+                                            onChange={(e) => setSearchQuery(e.target.value)}
+                                            className="w-full pl-10 pr-4 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-current smooth-transition text-sm"
+                                            style={{
+                                                background: 'var(--bg-primary)',
+                                                border: '1px solid var(--border-primary)',
+                                                color: 'var(--text-primary)',
+                                                fontFamily: 'monospace'
+                                            }}
+                                        />
+                                    </div>
+                                    {searchQuery && (
+                                        <button
+                                            onClick={() => setSearchQuery('')}
+                                            className="px-3 py-2 rounded-xl smooth-transition btn-secondary"
+                                        >
+                                            Clear
+                                        </button>
+                                    )}
+                                    {isJsonFile && (
+                                        <button
+                                            onClick={() => setShowFieldHelper(!showFieldHelper)}
+                                            className="px-3 py-2 rounded-xl smooth-transition btn-secondary flex items-center gap-2"
+                                        >
+                                            <Filter className="w-4 h-4" />
+                                            Fields
+                                        </button>
+                                    )}
+                                </div>
+
+                                {/* Example queries */}
+                                {isJsonFile && !searchQuery && (
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                        <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>Try:</span>
+                                        {getExampleQueries().map((example, idx) => (
+                                            <button
+                                                key={idx}
+                                                onClick={() => setSearchQuery(example)}
+                                                className="text-xs px-2 py-1 rounded-lg smooth-transition"
+                                                style={{
+                                                    background: 'var(--bg-tertiary)',
+                                                    color: 'var(--text-secondary)',
+                                                    border: '1px solid var(--border-primary)',
+                                                    fontFamily: 'monospace'
+                                                }}
+                                            >
+                                                {example}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
+
+                            {/* Field helper panel */}
+                            {isJsonFile && showFieldHelper && Object.keys(availableFields).length > 0 && (
+                                <div className="mt-3 p-3 rounded-lg overflow-y-auto" style={{
+                                    background: 'var(--bg-tertiary)',
+                                    border: '1px solid var(--border-primary)',
+                                    maxHeight: '200px'
+                                }}>
+                                    <div className="text-xs font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>
+                                        Available Fields (click to filter):
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2 text-xs">
+                                        {Object.entries(availableFields)
+                                            .sort((a, b) => b[1].count - a[1].count) // Sort by frequency
+                                            .map(([field, info]) => (
+                                                <div key={field} className="space-y-1">
+                                                    <div className="font-medium" style={{ color: 'var(--text-secondary)' }}>
+                                                        {field}
+                                                        <span style={{ color: 'var(--text-tertiary)' }}> ({info.type})</span>
+                                                    </div>
+                                                    <div className="flex flex-wrap gap-1">
+                                                        {info.sampleValues.slice(0, 3).map((value, idx) => (
+                                                            <button
+                                                                key={idx}
+                                                                onClick={() => insertFieldFilter(field, value)}
+                                                                className="px-1.5 py-0.5 rounded text-xs smooth-transition truncate max-w-[150px]"
+                                                                style={{
+                                                                    background: 'var(--bg-primary)',
+                                                                    color: 'var(--text-primary)',
+                                                                    border: '1px solid var(--border-primary)',
+                                                                    fontFamily: 'monospace'
+                                                                }}
+                                                                title={`Filter: ${field}:${value}`}
+                                                            >
+                                                                {value}
+                                                            </button>
+                                                        ))}
+                                                        {info.type === 'number' && (
+                                                            <>
+                                                                <button
+                                                                    onClick={() => insertFieldFilter(field, '0', '>')}
+                                                                    className="px-1.5 py-0.5 rounded text-xs smooth-transition"
+                                                                    style={{
+                                                                        background: 'var(--bg-primary)',
+                                                                        color: 'var(--text-tertiary)',
+                                                                        border: '1px solid var(--border-primary)',
+                                                                        fontFamily: 'monospace'
+                                                                    }}
+                                                                    title={`Filter: ${field}:>0`}
+                                                                >
+                                                                    {'>'}0
+                                                                </button>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                    </div>
+                                    <div className="mt-2 pt-2" style={{ borderTop: '1px solid var(--border-primary)' }}>
+                                        <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                                            💡 Combine with: AND, OR, NOT • Operators: : = != {'>'} {'>='} {'<'} {'<='}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
                         </div>
-                        
+
                         <div className="flex-1 overflow-y-auto font-mono text-sm" style={{ background: 'var(--bg-primary)' }}>
                             {loading ? (
                                 <div className="flex items-center justify-center h-full">
@@ -1047,41 +1435,58 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                                 </div>
                             ) : (
                                 <div className="p-4">
-                                    {displayedContent.map((line, index) => {
-                                        const level = getLogLevel(line);
-                                        const color = level === 'error' ? '#ef4444' : 
-                                                    level === 'warning' ? '#f59e0b' :
-                                                    level === 'info' ? '#3b82f6' : 'var(--text-primary)';
-                                        
+                                    {filteredContent.length === 0 && searchQuery && (
+                                        <div className="text-center py-8" style={{ color: 'var(--text-tertiary)' }}>
+                                            <Search className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                                            <p>No matches found for:</p>
+                                            <p className="mt-2 font-mono text-sm" style={{ color: 'var(--text-secondary)' }}>
+                                                {searchQuery}
+                                            </p>
+                                            <button
+                                                onClick={() => setSearchQuery('')}
+                                                className="mt-4 px-4 py-2 text-sm rounded-lg smooth-transition btn-secondary"
+                                            >
+                                                Clear Search
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    {displayedContent.map((lineData, index) => {
+                                        const actualLineNumber = lineData.index + 1;
+                                        const level = getLogLevel(lineData.raw);
+                                        const color = level === 'error' ? '#ef4444' :
+                                            level === 'warning' ? '#f59e0b' :
+                                                level === 'info' ? '#3b82f6' : 'var(--text-primary)';
+
                                         return (
-                                            <div 
-                                                key={index} 
-                                                ref={el => lineRefs.current[index + 1] = el}
+                                            <div
+                                                key={actualLineNumber}
+                                                ref={el => lineRefs.current[actualLineNumber] = el}
                                                 className="flex py-1 px-2 rounded smooth-transition"
                                                 style={{ ':hover': { background: 'var(--hover-bg)' } }}
                                                 onMouseEnter={(e) => {
-                                                    setCurrentLine(index + 1);
+                                                    setCurrentLine(actualLineNumber);
                                                     e.currentTarget.style.background = 'var(--hover-bg)';
                                                 }}
                                                 onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
                                             >
                                                 <span className="w-16 flex-shrink-0 select-none text-right pr-4" style={{ color: 'var(--text-tertiary)' }}>
-                                                    {index + 1}
+                                                    {actualLineNumber}
                                                 </span>
                                                 <pre className="flex-1 whitespace-pre-wrap break-all" style={{ color }}>
-                                                    {line}
+                                                    {lineData.raw}
                                                 </pre>
                                             </div>
                                         );
                                     })}
-                                    
+
                                     {hasMore && (
                                         <div className="mt-4 p-4 rounded-xl text-center" style={{
                                             background: 'var(--bg-secondary)',
                                             border: '1px solid var(--border-primary)'
                                         }}>
                                             <p className="mb-3" style={{ color: 'var(--text-secondary)' }}>
-                                                Showing {displayedContent.length} of {filteredContent.length} lines
+                                                Showing {displayedContent.length} of {filteredContent.length} filtered lines
                                             </p>
                                             <button
                                                 onClick={loadMore}
@@ -1422,7 +1827,7 @@ const CompactFileUploader = ({ onUploadComplete }) => {
                 type="file"
                 multiple
                 onChange={handleFileSelect}
-                accept=".tar,.tar.gz,.tgz,.zip"
+                accept=".tar,.gz,.tgz,.zip,application/gzip,application/x-tar,application/x-compressed-tar,application/zip"
                 className="hidden"
                 id="compact-file-input"
                 disabled={uploading}
@@ -1680,7 +2085,7 @@ const FileUploader = ({ onUploadComplete }) => {
                     type="file"
                     multiple
                     onChange={handleFileSelect}
-                    accept=".tar,.tar.gz,.tgz,.zip"
+                    accept=".tar,.gz,.tgz,.zip,application/gzip,application/x-tar,application/x-compressed-tar,application/zip"
                     className="hidden"
                     id="file-input"
                     disabled={uploading}
