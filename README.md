@@ -6,25 +6,23 @@ AI-powered log analyzer with advanced search features for GitLab SOS archives.
 
 ## What Makes This Special?
 
-**Smart Log Analysis That Actually Works**
+**Smart Log Analysis**
 - Clean, intuitive interface for viewing SOS archives
-- Drag & drop multiple archives - each gets its own tab that you can rename by double-clicking
-- PowerSearch with natural language - search like you think, not like a robot
-- Visual query builder for complex searches
-- Switch between traditional log view and structured table format
-- **Dark mode support** for those late-night troubleshooting sessions
+- Drag & drop/upload multiple archives - each gets its own tab that you can rename by double-clicking
+- PowerSearch: search logs usin easy queries
+- Visual query builder for complex search queries
+- Switch between traditional log view and structured table format and raw json view
+- Log viewer with inline search and filter options for quick search
 
-**AI-Powered Analysis**
-- Auto-analysis that scans for GitLab error patterns (takes a few minutes to run, but you can navigate other tabs or chat with Duo while it works)
+
+**Auto Analysis**
+- Auto-analysis that scans for GitLab hundreds of error patterns (takes a few minutes to run, but you can navigate other tabs or chat with Duo while it works)
 - Embedded GitLab Duo Chat for interactive log analysis
 - MCP server integration - your VS Code Duo Chat gets superpowers for SOS analysis
 - Hundreds of pre-configured GitLab error patterns from docs and codebase
-
-**Built for Real Work**
-- One command to rule them all - `python start.py` and you're done
 - Built-in fast stats - no more switching to terminal
-- Real-time service monitoring
-- Cross-platform support (macOS, Linux, Windows)
+
+
 
 ---
 
@@ -60,6 +58,12 @@ cd soslab
 ### 2. One Command to Start Everything
 ```bash
 python start.py
+```
+
+**Debug mode:**
+
+```
+python start.py --debug 
 ```
 
 Seriously, that's it! The script handles everything:
@@ -117,22 +121,23 @@ Starting Services:
 
 ### Getting Your SOS Archives In
 
-> **💡 Pro Tip**: Drag & drop works way better than the file picker! While you can use file selection, drag & drop gives you the most reliable upload experience.
-
 1. Open `http://localhost:3000` in your browser
-2. Drag your SOS archive files right onto the page
+2. Drag or upload your SOS archive files right onto the page
 3. Each archive gets its own tab - double-click the tab name to rename it (super helpful for multi-node setups)
 4. Start exploring!
 
 ### PowerSearch - Search Like a Human
 
-No need to learn complex query languages. Just search naturally:
+No need to learn complex query languages. Just search naturally using boolean operators 
 
 #### Query Syntax Examples:
 
 ```bash
 # Service and severity filtering
 service:rails,sidekiq AND severity:error
+
+# Specific file in rails
+service:rails:production_json
 
 # Simple text search
 error
@@ -195,7 +200,7 @@ NOT level:debug
 - **📄 Log View**: Traditional log format with syntax highlighting
 - **📊 Table View**: Structured data in sortable columns
 - **🔍 Search Results**: Filtered entries with highlighting
-- **🌙 Dark Mode**: Easy on the eyes for long troubleshooting sessions
+- **🌙 Dark Mode**: Easy on the eyes 
 
 ---
 
@@ -243,6 +248,8 @@ The app automatically starts an MCP server that gives your VS Code Duo Chat supe
 - "Compare error patterns between the two archives I uploaded"
 
 Duo will autonomously use the MCP tools to dig through your SOS archives and give you insights.
+
+![image2](https://gitlab.com/uploads/-/system/personal_snippet/4885492/13bc9633aaad1b0204068e816689f325/Screenshot_2025-09-17_at_2.32.24_PM.png)
 
 ---
 
