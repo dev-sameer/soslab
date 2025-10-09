@@ -463,42 +463,131 @@ class EnhancedAnalyzer:
         return line
     
     def _extract_archive(self, archive_path: Path, extract_dir: Path):
-        """Extract archive and return file info"""
-        
+        """Extract archive and return file info - with recursive extraction for nested archives"""
         extracted_info = []
         
-        if archive_path.suffix in ['.gz', '.tgz']:
-            with tarfile.open(archive_path, 'r:gz') as tar:
-                for member in tar.getmembers():
-                    if member.isfile():
-                        tar.extract(member, extract_dir)
-                        extracted_info.append({
-                            'relative_path': member.name,
-                            'full_path': extract_dir / member.name,
-                            'size': member.size
-                        })
+        # Convert to string to check full extension
+        archive_name = archive_path.name.lower()
+        
+        try:
+            # Handle different archive types
+            if archive_name.endswith('.tar.gz') or archive_name.endswith('.tgz'):
+                with tarfile.open(archive_path, 'r:gz') as tar:
+                    for member in tar.getmembers():
+                        if member.isfile():
+                            tar.extract(member, extract_dir)
+                            extracted_info.append({
+                                'relative_path': member.name,
+                                'full_path': extract_dir / member.name,
+                                'size': member.size
+                            })
+            
+            elif archive_name.endswith('.tar'):
+                with tarfile.open(archive_path, 'r') as tar:
+                    for member in tar.getmembers():
+                        if member.isfile():
+                            tar.extract(member, extract_dir)
+                            extracted_info.append({
+                                'relative_path': member.name,
+                                'full_path': extract_dir / member.name,
+                                'size': member.size
+                            })
+            
+            elif archive_name.endswith('.zip'):
+                with zipfile.ZipFile(archive_path) as zf:
+                    for info in zf.infolist():
+                        if not info.is_dir():
+                            zf.extract(info, extract_dir)
+                            extracted_info.append({
+                                'relative_path': info.filename,
+                                'full_path': extract_dir / info.filename,
+                                'size': info.file_size
+                            })
+            
+            else:
+                raise ValueError(f"Unsupported archive format: {archive_path.name}")
+        
+        except Exception as e:
+            print(f"❌ Error extracting {archive_path.name}: {e}")
+            raise
+        
+        # Filter out macOS metadata files early
+        extracted_info = [
+            f for f in extracted_info 
+            if not Path(f['relative_path']).name.startswith('._')
+        ]
+        
+        # RECURSIVE EXTRACTION: Check for nested archives
+        nested_archives = []
+        archive_extensions = {'.tar', '.tar.gz', '.tgz', '.zip'}
+        
+        for file_info in extracted_info:
+            file_path = file_info['full_path']
+            file_name_lower = file_path.name.lower()
+            
+            # Check if this is a nested archive
+            is_archive = any(
+                file_name_lower.endswith(ext) 
+                for ext in archive_extensions
+            )
+            
+            if is_archive and not file_path.name.startswith('._'):
+                nested_archives.append(file_info)
+        
+        # Extract nested archives
+        if nested_archives:
+            print(f"📦 Found {len(nested_archives)} nested archive(s) to extract")
+            
+            # Track which items to remove (don't modify list during iteration)
+            to_remove = []
+            nested_files = []
+            
+            for nested_info in nested_archives:
+                nested_path = nested_info['full_path']
+                print(f"  📂 Extracting nested: {nested_info['relative_path']}")
+                
+                try:
+                    # Create a subdirectory for nested archive contents
+                    # This prevents file conflicts and maintains structure
+                    nested_dir_name = nested_path.stem
+                    if nested_path.name.lower().endswith('.tar.gz'):
+                        # Remove both .tar and .gz extensions
+                        nested_dir_name = nested_path.name[:-7]
+                    
+                    nested_extract_dir = extract_dir / Path(nested_info['relative_path']).parent / nested_dir_name
+                    nested_extract_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Recursively extract
+                    nested_extracted = self._extract_archive(nested_path, nested_extract_dir)
+                    
+                    # Update paths to be relative to original extract_dir
+                    for nested_file in nested_extracted:
+                        nested_file['relative_path'] = str(
+                            Path(nested_info['relative_path']).parent / 
+                            nested_dir_name / 
+                            nested_file['relative_path']
+                        )
+                        nested_file['full_path'] = extract_dir / nested_file['relative_path']
+                    
+                    nested_files.extend(nested_extracted)
+                    to_remove.append(nested_info)
+                    
+                    # Delete the nested archive file to save space
+                    try:
+                        nested_path.unlink()
+                        print(f"  ✅ Cleaned up: {nested_path.name}")
+                    except Exception as e:
+                        print(f"  ⚠️ Could not delete archive: {e}")
                         
-        elif archive_path.suffix == '.tar':
-            with tarfile.open(archive_path, 'r') as tar:
-                for member in tar.getmembers():
-                    if member.isfile():
-                        tar.extract(member, extract_dir)
-                        extracted_info.append({
-                            'relative_path': member.name,
-                            'full_path': extract_dir / member.name,
-                            'size': member.size
-                        })
-                        
-        elif archive_path.suffix == '.zip':
-            with zipfile.ZipFile(archive_path) as zf:
-                for info in zf.infolist():
-                    if not info.is_dir():
-                        zf.extract(info, extract_dir)
-                        extracted_info.append({
-                            'relative_path': info.filename,
-                            'full_path': extract_dir / info.filename,
-                            'size': info.file_size
-                        })
+                except Exception as e:
+                    print(f"  ⚠️ Failed to extract nested archive {nested_info['relative_path']}: {e}")
+            
+            # Remove nested archives from list and add extracted files
+            extracted_info = [
+                f for f in extracted_info 
+                if f not in to_remove
+            ]
+            extracted_info.extend(nested_files)
         
         return extracted_info
     
