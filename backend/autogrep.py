@@ -1403,9 +1403,65 @@ class AutoGrep:
             return self._generate_report()
     
     def _extract_tar(self, tar_path: str, dest: str):
-        """Extract tar.gz file"""
-        with tarfile.open(tar_path, 'r:gz') as tar:
-            tar.extractall(dest)
+        """
+        Extract archive file - handles tar, tar.gz, tgz, and zip files
+        Surgical fix to handle different archive types without breaking existing functionality
+        """
+        import tarfile
+        import zipfile
+        
+        archive_name = os.path.basename(tar_path).lower()
+        
+        try:
+            # Detect and extract based on file extension
+            if archive_name.endswith('.zip'):
+                # Handle ZIP files
+                print(f"  📦 Detected ZIP archive")
+                with zipfile.ZipFile(tar_path, 'r') as zf:
+                    zf.extractall(dest)
+                    
+            elif archive_name.endswith('.tar.gz') or archive_name.endswith('.tgz'):
+                # Handle gzipped tar files
+                print(f"  📦 Detected TAR.GZ archive")
+                with tarfile.open(tar_path, 'r:gz') as tar:
+                    tar.extractall(dest)
+                    
+            elif archive_name.endswith('.tar'):
+                # Handle plain tar files  
+                print(f"  📦 Detected TAR archive")
+                with tarfile.open(tar_path, 'r') as tar:
+                    tar.extractall(dest)
+                    
+            else:
+                # Fallback: try to detect by magic bytes
+                print(f"  ⚠️  Unknown extension, detecting format...")
+                
+                with open(tar_path, 'rb') as f:
+                    magic = f.read(4)
+                
+                if magic[:2] == b'PK':
+                    # ZIP file signature
+                    print(f"  📦 Detected ZIP by magic bytes")
+                    with zipfile.ZipFile(tar_path, 'r') as zf:
+                        zf.extractall(dest)
+                        
+                elif magic[:3] == b'\x1f\x8b\x08':
+                    # GZIP signature
+                    print(f"  📦 Detected GZIP by magic bytes")
+                    with tarfile.open(tar_path, 'r:gz') as tar:
+                        tar.extractall(dest)
+                        
+                else:
+                    # Try as plain tar as last resort
+                    print(f"  📦 Attempting TAR extraction")
+                    with tarfile.open(tar_path, 'r') as tar:
+                        tar.extractall(dest)
+                        
+            print(f"  ✅ Successfully extracted to {dest}")
+            
+        except Exception as e:
+            print(f"  ❌ Failed to extract {tar_path}: {e}")
+            raise Exception(f"Could not extract archive: {e}")
     
     def _find_log_files(self, root: Path) -> List[Path]:
         """Find all relevant log files"""
