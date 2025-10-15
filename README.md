@@ -4,6 +4,22 @@ AI-powered log analyzer with advanced search features for GitLab SOS archives.
 
 ![image](https://gitlab.com/uploads/-/system/personal_snippet/4885492/c1809191e6223af9dc1e44a91c07dbd2/soslab.png)
 
+---
+
+## 📋 Quick Navigation
+
+- 🎬 [Demo Video](#demo-video)
+- 🚀 [Getting Started](#getting-started-the-easy-way)
+- 📦 [Prerequisites](#before-you-start)
+- 💡 [Key Features](#what-makes-this-special)
+- 📈 [System Metrics Dashboard](#system-metrics-dashboard)
+- 🔍 [PowerSearch Guide](#powersearch---search-like-a-human)
+- 🤖 [AI Integration](#ai-integration)
+- 📊 [Using the Analyzer](#using-the-analyzer)
+
+
+---
+
 ## What Makes This Special?
 
 **Smart Log Analysis**
@@ -217,6 +233,36 @@ python start.py
 
 Now you can paste error logs directly into the embedded chat and get real-time analysis and suggestions.
 
+### System Metrics Dashboard
+
+Get instant visibility into system health across all your nodes:
+
+#### Default parsed view: 
+
+![Screenshot_2025-10-15_at_7.36.39_AM](/uploads/5a1fe7de75992c473e759bad23eb41ee/Screenshot_2025-10-15_at_7.36.39_AM.png)
+
+![Screenshot_2025-10-15_at_7.37.20_AM](/uploads/08fb40c4affb6d127e6514b75a1499d5/Screenshot_2025-10-15_at_7.37.20_AM.png)
+
+#### Raw logs viewer: 
+
+![Screenshot_2025-10-15_at_7.38.50_AM](/uploads/28af12964f6381a1dee1249e5d709f02/Screenshot_2025-10-15_at_7.38.50_AM.png)
+
+
+
+**Parsed Metrics View:**
+- **System Overview**: Load average, CPU usage, memory utilization, disk space at a glance
+- **Process Monitoring**: Top CPU and memory consuming processes with detailed stats
+- **Critical Alerts**: Automatic highlighting of zombies, high resource usage, and disk space issues
+- **Quick Stats**: vmstat, free, df, uptime - all parsed and visualized
+
+**Raw Logs View:**
+- Access original command output for detailed analysis
+- 31+ system commands available (top, vmstat, free, df, uptime, and more)
+- Switch between parsed and raw views instantly
+
+Perfect for quickly identifying performance bottlenecks, resource constraints, and system health issues across multi-node GitLab deployments.
+
+
 ### VS Code Integration (The Cool Part)
 
 The app automatically starts an MCP server that gives your VS Code Duo Chat superpowers for SOS analysis.
@@ -256,4 +302,4 @@ Duo will autonomously use the MCP tools to dig through your SOS archives and giv
 ## A Few Things to Know
 
 ### Auto Analysis
-When you upload archives, the auto-analysis kicks off automatically. **It takes a few minutes to run** (we're scanning through potentially thousands of log entries), but you can navigate to other tabs or chat with Duo while it works in the background.
+ **It takes a few minutes to run** (we're scanning through potentially thousands of log entries), but you can navigate to other tabs or chat with Duo while it works in the background.
