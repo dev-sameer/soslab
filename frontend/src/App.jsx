@@ -10,6 +10,7 @@ import PowerSearch from './components/PowerSearch';
 import DuoChatWidget from './components/DuoChatWidget';
 import FastStatsDashboard from './components/FastStatsDashboard';
 import AutoAnalysis from './components/AutoAnalysis';
+import SystemMetrics from './components/SystemMetrics';
 
 
 
@@ -2734,7 +2735,8 @@ function App() {
                                 { id: 'viewer', icon: FileText, label: 'Log Viewer', enabled: !!analysisData },
                                 { id: 'auto-analysis', icon: Sparkles, label: 'Auto-Analysis', enabled: !!analysisData },
                                 { id: 'fast-stats', icon: BarChart3, label: 'FastStats', enabled: !!analysisData },
-                                { id: 'power-search', icon: Zap, label: 'Power Search', enabled: !!analysisData }
+                                { id: 'power-search', icon: Zap, label: 'Power Search', enabled: !!analysisData },
+                                { id: 'system', icon: Activity, label: 'System Metrics', enabled: !!analysisData }
                             ].map(item => (
                                 <button
                                     key={item.id}
@@ -2870,6 +2872,10 @@ function App() {
                                 currentNodeId={activeNodeId}
                                 initialQuery={powerSearchQuery}
                             />
+                        )}
+
+                        {activeTab === 'system' && analysisData && (
+                            <SystemMetrics sessionId={sessionId} />
                         )}
                     </div>
                 </div>

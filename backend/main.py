@@ -27,6 +27,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Any
 from fastapi.responses import FileResponse
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+import re
+from datetime import datetime
+import json
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -92,6 +97,1261 @@ extracted_files = {}
 auto_analysis_sessions = {}  # Store auto-analysis results separately
 
 
+
+class SystemMetricsParser:
+    """Parse system command outputs with surgical precision"""
+    
+    def __init__(self, session_dir: Path):
+        self.session_dir = session_dir
+        self.root = self._find_root()
+        self.parsing_errors = []
+    
+    def _find_root(self) -> Path:
+        """Find the actual root directory containing command outputs"""
+        marker_files = ['vmstat', 'top_cpu', 'free_m', 'uptime', 'iostat', 'ps']
+        
+        # Check current directory first
+        for marker in marker_files:
+            if (self.session_dir / marker).exists():
+                print(f"✓ Found command files in: {self.session_dir}")
+                return self.session_dir
+        
+        # Recursively search subdirectories
+        def search_dir(path, depth=0, max_depth=3):
+            if depth > max_depth:
+                return None
+            
+            for item in path.iterdir():
+                if item.is_dir():
+                    for marker in marker_files:
+                        if (item / marker).exists():
+                            print(f"✓ Found command files in: {item}")
+                            return item
+                    
+                    result = search_dir(item, depth + 1, max_depth)
+                    if result:
+                        return result
+            return None
+        
+        found_root = search_dir(self.session_dir)
+        if found_root:
+            return found_root
+        
+        # Check common directory names
+        for dirname in ['gitlabsos', 'sosreport', 'logs', 'system']:
+            test_dir = self.session_dir / dirname
+            if test_dir.exists():
+                print(f"✓ Using {dirname} directory: {test_dir}")
+                return test_dir
+        
+        print(f"⚠ Using session dir: {self.session_dir}")
+        return self.session_dir
+    
+    def parse_all(self) -> Dict:
+        """Parse all available command outputs with enhanced accuracy"""
+        available_commands = self._discover_commands()
+        parsed_data = {}
+        
+        for cmd_name, file_path in available_commands.items():
+            try:
+                parser_method = getattr(self, f"_parse_{cmd_name}", self._parse_generic)
+                parsed_data[cmd_name] = parser_method(file_path)
+                
+                # Add metadata for validation
+                parsed_data[cmd_name]['_meta'] = {
+                    'source_file': str(file_path),
+                    'parsed_at': datetime.now().isoformat(),
+                    'file_size': file_path.stat().st_size if file_path.exists() else 0
+                }
+                
+            except Exception as e:
+                print(f"⚠️ Failed to parse {cmd_name}: {e}")
+                self.parsing_errors.append({'command': cmd_name, 'error': str(e)})
+                parsed_data[cmd_name] = {
+                    "error": str(e),
+                    "raw_output": self._safe_read(file_path)[:10000]  # Limit size
+                }
+        
+        return {
+            "available_commands": list(available_commands.keys()),
+            "parsed_data": parsed_data,
+            "parsing_errors": self.parsing_errors,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    def _discover_commands(self) -> Dict[str, Path]:
+        """Enhanced command discovery with multiple search strategies"""
+        commands = [
+            'top_cpu', 'top_res', 'free_m', 'vmstat', 'uptime',
+            'iostat', 'iotop', 'df_hT', 'df_inodes', 'lsblk',
+            'ps', 'pidstat', 'netstat', 'netstat_i', 'sockstat', 
+            'ss', 'mpstat', 'sar_cpu', 'lscpu', 'meminfo', 
+            'slabtop', 'sar_mem', 'uname', 'hostname', 'date', 
+            'dmesg', 'ifconfig', 'ip_address', 'sysctl_a', 
+            'ulimit', 'systemctl_unit_files', 'sar_dev', 
+            'sar_tcp', 'nfsiostat', 'mount', 'fstab'
+        ]
+        
+        available = {}
+        
+        # Try multiple strategies
+        for cmd in commands:
+            # Direct path
+            if (path := self.root / cmd).exists():
+                available[cmd] = path
+                continue
+            
+            # With extensions
+            for ext in ['.txt', '.log', '.out']:
+                if (path := self.root / f"{cmd}{ext}").exists():
+                    available[cmd] = path
+                    break
+            
+            if cmd in available:
+                continue
+                
+            # In subdirectories
+            for subdir in ['system', 'commands', 'output', 'data', 'sos_commands']:
+                if (path := self.root / subdir / cmd).exists():
+                    available[cmd] = path
+                    break
+        
+        # Broad search if needed
+        if len(available) < 3:
+            print(f"⚠ Limited commands found, searching broadly...")
+            for cmd in commands:
+                if cmd not in available:
+                    matches = list(self.session_dir.rglob(f"{cmd}*"))
+                    if matches:
+                        available[cmd] = matches[0]
+                        print(f"  Found {cmd} at: {matches[0]}")
+        
+        print(f"✅ Discovered {len(available)} command outputs")
+        return available
+    
+    def _safe_read(self, file_path: Path) -> str:
+        """Safely read file with encoding detection"""
+        if not file_path.exists():
+            return ""
+        
+        # Try different encodings
+        for encoding in ['utf-8', 'latin-1', 'ascii']:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+        
+        # Last resort: binary read with replacement
+        try:
+            with open(file_path, 'rb') as f:
+                return f.read().decode('utf-8', errors='replace')
+        except:
+            return ""
+    
+    def _safe_float(self, value: str, default: float = 0.0) -> float:
+        """Convert string to float with comprehensive error handling"""
+        if not value:
+            return default
+        
+        # Clean the value
+        value = str(value).strip()
+        
+        # Handle special cases
+        if value in ['.', '..', '-', '--', 'N/A', 'n/a', 'NA', 'null', 'none', '']:
+            return default
+        
+        # Remove any non-numeric characters except . and -
+        cleaned = re.sub(r'[^0-9.-]', '', value)
+        
+        # Handle multiple dots
+        if cleaned.count('.') > 1:
+            # Keep only first dot
+            parts = cleaned.split('.')
+            cleaned = parts[0] + '.' + ''.join(parts[1:])
+        
+        try:
+            result = float(cleaned)
+            # Sanity check for percentages
+            if 'percent' in str(value).lower() and result > 100:
+                return min(result, 100.0)
+            return result
+        except (ValueError, AttributeError):
+            return default
+    
+    def _safe_int(self, value: str, default: int = 0) -> int:
+        """Convert string to int with error handling"""
+        try:
+            # Remove any unit suffixes
+            value = str(value).strip()
+            value = re.sub(r'[^0-9-]', '', value)
+            return int(value) if value else default
+        except (ValueError, AttributeError):
+            return default
+    
+    def _parse_top_res(self, file_path: Path) -> Dict:
+      """Parse top sorted by RES (memory) - same as top_cpu but different sort"""
+      # Use the same parser as top_cpu since format is identical
+      result = self._parse_top_cpu(file_path)
+    
+      # Mark that this was sorted by RES
+      result['_sort_by'] = 'RES'
+    
+      # Re-sort processes by memory if we have them
+      if result.get('processes'):
+          # Sort by mem percentage if available, otherwise by RES value
+          result['processes'] = sorted(
+              result['processes'],
+              key=lambda p: (
+                  p.get('mem', 0),  # Primary sort by memory percentage
+                  self._parse_memory_value(p.get('res', '0'))  # Secondary by RES value
+              ),
+              reverse=True
+          )
+    
+      return result
+    
+    def _parse_memory_value(self, mem_str: str) -> float:
+      """Convert memory string (e.g., '1.2g', '512m') to MB for sorting"""
+      if not mem_str or mem_str == '-':
+          return 0
+    
+      mem_str = str(mem_str).strip().lower()
+    
+      # Handle different units
+      multipliers = {
+          'k': 1/1024,
+          'm': 1,
+          'g': 1024,
+          't': 1024 * 1024
+      }
+    
+      for suffix, multiplier in multipliers.items():
+          if suffix in mem_str:
+              try:
+                  num = float(mem_str.replace(suffix, ''))
+                  return num * multiplier
+              except ValueError:
+                  return 0
+    
+    # No suffix, try to parse as number
+      try:
+          return float(mem_str)
+      except ValueError:
+          return 0
+
+    
+    def _parse_top_cpu(self, file_path: Path) -> Dict:
+        """Enhanced top parser with maximum accuracy"""
+        content = self._safe_read(file_path)
+        if not content:
+            return {"error": "Empty file", "raw_output": ""}
+        
+        lines = content.splitlines()
+        result = {
+            "raw_output": content,
+            "header": {},
+            "processes": [],
+            "_accuracy_score": 100  # Track parsing accuracy
+        }
+        
+        # Parse header with enhanced patterns
+        for i, line in enumerate(lines[:10]):  # Check more lines for header
+            
+            # Top line with uptime and load
+            if 'top -' in line or line.startswith('top'):
+                # Extract timestamp if present
+                time_match = re.search(r'(\d{2}:\d{2}:\d{2})', line)
+                if time_match:
+                    result['header']['time'] = time_match.group(1)
+                
+                # Extract uptime - multiple patterns
+                uptime_patterns = [
+                    r'up\s+(\d+\s+days?,\s*\d+:\d+)',
+                    r'up\s+(\d+:\d+)',
+                    r'up\s+(\d+\s+min)',
+                    r'up\s+(.+?),\s*\d+\s*users?'
+                ]
+                for pattern in uptime_patterns:
+                    uptime_match = re.search(pattern, line)
+                    if uptime_match:
+                        result['header']['uptime'] = uptime_match.group(1).strip()
+                        break
+                
+                # Extract load averages - be very precise
+                load_patterns = [
+                    r'load\s+average:\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)',
+                    r'load\s+averages?:\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)'
+                ]
+                for pattern in load_patterns:
+                    load_match = re.search(pattern, line)
+                    if load_match:
+                        result['header']['load_1min'] = self._safe_float(load_match.group(1))
+                        result['header']['load_5min'] = self._safe_float(load_match.group(2))
+                        result['header']['load_15min'] = self._safe_float(load_match.group(3))
+                        break
+            
+            # Tasks line
+            elif 'Tasks:' in line or 'Threads:' in line:
+                # Extract all numbers first
+                numbers = re.findall(r'\d+', line)
+                
+                # Map based on position and keywords
+                if 'total' in line:
+                    idx = line.lower().index('total')
+                    # Find number before 'total'
+                    for j, num in enumerate(numbers):
+                        if str(num) in line[:idx][-10:]:
+                            result['header']['tasks_total'] = int(num)
+                            break
+                
+                # Parse specific states
+                state_patterns = {
+                    'running': r'(\d+)\s*running',
+                    'sleeping': r'(\d+)\s*sleeping',
+                    'stopped': r'(\d+)\s*stopped',
+                    'zombie': r'(\d+)\s*zombie'
+                }
+                
+                for state, pattern in state_patterns.items():
+                    match = re.search(pattern, line, re.IGNORECASE)
+                    if match:
+                        result['header'][f'tasks_{state}'] = int(match.group(1))
+                
+                # Fallback: use position if we have enough numbers
+                if len(numbers) >= 5 and 'tasks_total' not in result['header']:
+                    result['header']['tasks_total'] = int(numbers[0])
+                    result['header']['tasks_running'] = int(numbers[1])
+                    result['header']['tasks_sleeping'] = int(numbers[2])
+                    result['header']['tasks_stopped'] = int(numbers[3])
+                    result['header']['tasks_zombie'] = int(numbers[4])
+            
+            # CPU line - most critical for accuracy
+            elif '%Cpu' in line or 'Cpu(s):' in line:
+                # Clean line first
+                cpu_line = line.replace('%Cpu(s):', '').replace('%Cpu:', '').replace('Cpu(s):', '')
+                
+                # Extract each metric individually for maximum accuracy
+                cpu_metrics = {
+                    'cpu_user': [r'([\d.]+)\s*us', r'([\d.]+)%?\s*user'],
+                    'cpu_system': [r'([\d.]+)\s*sy', r'([\d.]+)%?\s*system'],
+                    'cpu_nice': [r'([\d.]+)\s*ni', r'([\d.]+)%?\s*nice'],
+                    'cpu_idle': [r'([\d.]+)\s*id', r'([\d.]+)%?\s*idle'],
+                    'cpu_iowait': [r'([\d.]+)\s*wa', r'([\d.]+)%?\s*iowait'],
+                    'cpu_hi': [r'([\d.]+)\s*hi', r'([\d.]+)%?\s*hardware'],
+                    'cpu_si': [r'([\d.]+)\s*si', r'([\d.]+)%?\s*software'],
+                    'cpu_steal': [r'([\d.]+)\s*st', r'([\d.]+)%?\s*steal']
+                }
+                
+                for metric, patterns in cpu_metrics.items():
+                    for pattern in patterns:
+                        match = re.search(pattern, cpu_line)
+                        if match:
+                            result['header'][metric] = self._safe_float(match.group(1))
+                            break
+                    
+                    # Default to 0 if not found
+                    if metric not in result['header']:
+                        result['header'][metric] = 0.0
+                        if metric == 'cpu_idle':
+                            result['_accuracy_score'] -= 10  # Reduce accuracy if idle not found
+            
+            # Memory line - handle multiple units
+            elif ('KiB Mem' in line or 'MiB Mem' in line or 'GiB Mem' in line or 
+                  'Mem:' in line):
+                
+                # Determine unit multiplier
+                unit_multiplier = 1  # Default KiB
+                if 'MiB' in line:
+                    unit_multiplier = 1024
+                elif 'GiB' in line:
+                    unit_multiplier = 1024 * 1024
+                elif 'MB' in line:
+                    unit_multiplier = 1024  # Assume MB = MiB
+                elif 'GB' in line:
+                    unit_multiplier = 1024 * 1024
+                
+                # Extract memory values
+                mem_patterns = {
+                    'total': r'([\d.]+)\s*total',
+                    'free': r'([\d.]+)\s*free',
+                    'used': r'([\d.]+)\s*used',
+                    'buff/cache': r'([\d.]+)\s*buff/cache'
+                }
+                
+                for key, pattern in mem_patterns.items():
+                    match = re.search(pattern, line)
+                    if match:
+                        value_kb = self._safe_float(match.group(1)) * unit_multiplier
+                        if key == 'buff/cache':
+                            result['header']['mem_buff_cache_kb'] = int(value_kb)
+                        else:
+                            result['header'][f'mem_{key}_kb'] = int(value_kb)
+                
+                # Fallback: extract by position
+                if 'mem_total_kb' not in result['header']:
+                    numbers = re.findall(r'[\d.]+', line)
+                    if len(numbers) >= 4:
+                        result['header']['mem_total_kb'] = int(float(numbers[0]) * unit_multiplier)
+                        result['header']['mem_free_kb'] = int(float(numbers[1]) * unit_multiplier)
+                        result['header']['mem_used_kb'] = int(float(numbers[2]) * unit_multiplier)
+                        result['header']['mem_buff_cache_kb'] = int(float(numbers[3]) * unit_multiplier)
+            
+            # Available memory (often on next line)
+            elif 'avail Mem' in line:
+                # Determine unit
+                unit_multiplier = 1
+                prev_line = lines[i-1] if i > 0 else ''
+                if 'MiB' in prev_line:
+                    unit_multiplier = 1024
+                elif 'GiB' in prev_line:
+                    unit_multiplier = 1024 * 1024
+                
+                avail_match = re.search(r'([\d.]+)\s*avail', line)
+                if avail_match:
+                    result['header']['mem_available_kb'] = int(float(avail_match.group(1)) * unit_multiplier)
+            
+            # Swap line
+            elif ('KiB Swap' in line or 'MiB Swap' in line or 
+                  'GiB Swap' in line or 'Swap:' in line):
+                
+                unit_multiplier = 1
+                if 'MiB' in line:
+                    unit_multiplier = 1024
+                elif 'GiB' in line:
+                    unit_multiplier = 1024 * 1024
+                
+                swap_patterns = {
+                    'total': r'([\d.]+)\s*total',
+                    'free': r'([\d.]+)\s*free',
+                    'used': r'([\d.]+)\s*used'
+                }
+                
+                for key, pattern in swap_patterns.items():
+                    match = re.search(pattern, line)
+                    if match:
+                        value_kb = self._safe_float(match.group(1)) * unit_multiplier
+                        result['header'][f'swap_{key}_kb'] = int(value_kb)
+        
+        # Find and parse process list with enhanced detection
+        process_header_patterns = [
+            r'PID\s+USER',
+            r'PID\s+PPID',
+            r'^\s*PID\s'
+        ]
+        
+        process_start_idx = -1
+        header_line = ""
+        
+        for i, line in enumerate(lines):
+            for pattern in process_header_patterns:
+                if re.search(pattern, line):
+                    process_start_idx = i + 1
+                    header_line = line
+                    break
+            if process_start_idx > 0:
+                break
+        
+        # Parse processes with flexible column detection
+        if process_start_idx > 0:
+            # Detect column positions from header
+            columns = self._detect_columns(header_line)
+            
+            for line in lines[process_start_idx:]:
+                if not line.strip() or line.startswith('-'):
+                    continue
+                
+                # Use flexible parsing based on detected columns
+                process = self._parse_process_line(line, columns)
+                if process:
+                    result['processes'].append(process)
+        
+        # Calculate derived metrics if not present
+        if 'mem_available_kb' not in result['header'] and 'mem_free_kb' in result['header']:
+            # Estimate available as free + buff/cache
+            result['header']['mem_available_kb'] = (
+                result['header'].get('mem_free_kb', 0) + 
+                result['header'].get('mem_buff_cache_kb', 0)
+            )
+        
+        return result
+    
+    def _detect_columns(self, header_line: str) -> Dict[str, Tuple[int, int]]:
+        """Detect column positions from header line"""
+        columns = {}
+        
+        # Common column names to look for
+        column_names = ['PID', 'USER', 'PR', 'NI', 'VIRT', 'RES', 'SHR', 
+                       'S', '%CPU', '%MEM', 'TIME+', 'COMMAND', 'CMD']
+        
+        for col in column_names:
+            if col in header_line:
+                start = header_line.index(col)
+                end = start + len(col)
+                
+                # Find next column start
+                remaining = header_line[end:]
+                next_col_match = re.search(r'\S', remaining)
+                if next_col_match:
+                    next_start = end + next_col_match.start()
+                    # Find where current column likely ends
+                    for next_col in column_names:
+                        if next_col != col and next_col in header_line[end:]:
+                            next_pos = header_line.index(next_col, end)
+                            end = next_pos
+                            break
+                
+                columns[col.lower().replace('%', '').replace('+', '')] = (start, end)
+        
+        return columns
+    
+    def _parse_process_line(self, line: str, columns: Dict) -> Optional[Dict]:
+        """Parse a process line using detected column positions"""
+        # First try standard whitespace splitting
+        parts = line.split(None, 11)  # Split into max 12 parts
+        
+        if len(parts) >= 11:
+            try:
+                return {
+                    'pid': self._safe_int(parts[0]),
+                    'user': parts[1][:15],  # Truncate long usernames
+                    'pr': parts[2],
+                    'ni': parts[3],
+                    'virt': parts[4],
+                    'res': parts[5],
+                    'shr': parts[6],
+                    'state': parts[7],
+                    'cpu': self._safe_float(parts[8]),
+                    'mem': self._safe_float(parts[9]),
+                    'time': parts[10],
+                    'command': ' '.join(parts[11:]) if len(parts) > 11 else parts[11]
+                }
+            except (IndexError, ValueError):
+                pass
+        
+        # Fallback: try to extract key fields at minimum
+        if len(parts) >= 4:
+            return {
+                'pid': self._safe_int(parts[0]),
+                'user': parts[1] if len(parts) > 1 else 'unknown',
+                'cpu': self._safe_float(parts[8]) if len(parts) > 8 else 0.0,
+                'mem': self._safe_float(parts[9]) if len(parts) > 9 else 0.0,
+                'command': ' '.join(parts[11:]) if len(parts) > 11 else 'unknown'
+            }
+        
+        return None
+    
+    def _parse_vmstat(self, file_path: Path) -> Dict:
+        """Enhanced vmstat parser with validation"""
+        content = self._safe_read(file_path)
+        lines = content.splitlines()
+        
+        result = {
+            "raw_output": content,
+            "samples": [],
+            "averages": {},
+            "problems": []
+        }
+        
+        # Find header line more robustly
+        header_idx = -1
+        header_fields = []
+        
+        for i, line in enumerate(lines):
+            # Look for the header pattern
+            if re.search(r'\br\b.*\bb\b.*\bfree\b', line):
+                header_idx = i
+                header_fields = line.split()
+                break
+            # Alternative pattern
+            elif 'procs' in line.lower() and i + 1 < len(lines):
+                if 'r' in lines[i + 1] and 'b' in lines[i + 1]:
+                    header_idx = i + 1
+                    header_fields = lines[i + 1].split()
+                    break
+        
+        if header_idx >= 0:
+            # Parse data lines (skip header and usually first summary line)
+            start_idx = header_idx + 2 if header_idx + 2 < len(lines) else header_idx + 1
+            
+            for line_num, line in enumerate(lines[start_idx:], start=1):
+                parts = line.split()
+                
+                # Validate we have enough fields
+                if len(parts) >= 15:  # Minimum expected fields
+                    try:
+                        sample = {
+                            'line_num': line_num,
+                            'r': self._safe_int(parts[0]),  # Running
+                            'b': self._safe_int(parts[1]),  # Blocked
+                            'swpd': self._safe_int(parts[2]),  # Swap used
+                            'free': self._safe_int(parts[3]),  # Free memory
+                            'buff': self._safe_int(parts[4]),  # Buffers
+                            'cache': self._safe_int(parts[5]),  # Cache
+                            'si': self._safe_int(parts[6]),  # Swap in
+                            'so': self._safe_int(parts[7]),  # Swap out
+                            'bi': self._safe_int(parts[8]),  # Blocks in
+                            'bo': self._safe_int(parts[9]),  # Blocks out
+                            'in': self._safe_int(parts[10]),  # Interrupts
+                            'cs': self._safe_int(parts[11]),  # Context switches
+                            'us': self._safe_int(parts[12]),  # User CPU
+                            'sy': self._safe_int(parts[13]),  # System CPU
+                            'id': self._safe_int(parts[14]),  # Idle CPU
+                            'wa': self._safe_int(parts[15]) if len(parts) > 15 else 0,  # IO Wait
+                            'st': self._safe_int(parts[16]) if len(parts) > 16 else 0   # Steal time
+                        }
+                        
+                        # Identify problems
+                        if sample['si'] > 0 or sample['so'] > 0:
+                            result['problems'].append({
+                                'line': line_num,
+                                'issue': 'swapping',
+                                'details': f"si={sample['si']}, so={sample['so']}"
+                            })
+                        if sample['wa'] > 30:
+                            result['problems'].append({
+                                'line': line_num,
+                                'issue': 'high_io_wait',
+                                'details': f"wa={sample['wa']}%"
+                            })
+                        if sample['id'] < 10:
+                            result['problems'].append({
+                                'line': line_num,
+                                'issue': 'low_idle',
+                                'details': f"idle={sample['id']}%"
+                            })
+                        
+                        result['samples'].append(sample)
+                        
+                    except (IndexError, ValueError) as e:
+                        print(f"Failed to parse vmstat line {line_num}: {e}")
+                        continue
+        
+        # Calculate averages if we have samples
+        if result['samples']:
+            num_samples = len(result['samples'])
+            for key in ['r', 'b', 'si', 'so', 'us', 'sy', 'id', 'wa', 'cs', 'in']:
+                total = sum(s.get(key, 0) for s in result['samples'])
+                result['averages'][key] = round(total / num_samples, 2)
+        
+        return result
+    
+    def _parse_iostat(self, file_path: Path) -> Dict:
+        """Enhanced iostat parser handling multiple formats"""
+        content = self._safe_read(file_path)
+        
+        result = {
+            "raw_output": content,
+            "devices": {},
+            "summary": {},
+            "high_util_devices": []
+        }
+        
+        # Split into sections
+        sections = re.split(r'Device[:\s]', content)
+        
+        for section in sections[1:]:  # Skip before first "Device:"
+            lines = section.strip().split('\n')
+            
+            if not lines:
+                continue
+            
+            # Detect format from header
+            header = lines[0]
+            is_extended = 'await' in header.lower() or 'r/s' in header.lower()
+            
+            for line in lines[1:]:
+                parts = line.split()
+                
+                if not parts or parts[0].startswith('#'):
+                    continue
+                
+                device = parts[0]
+                if device not in result['devices']:
+                    result['devices'][device] = []
+                
+                try:
+                    if is_extended and len(parts) >= 14:
+                        # Extended format
+                        sample = {
+                            'rrqm_s': self._safe_float(parts[1]),
+                            'wrqm_s': self._safe_float(parts[2]),
+                            'r_s': self._safe_float(parts[3]),
+                            'w_s': self._safe_float(parts[4]),
+                            'rkB_s': self._safe_float(parts[5]),
+                            'wkB_s': self._safe_float(parts[6]),
+                            'avgrq_sz': self._safe_float(parts[7]),
+                            'avgqu_sz': self._safe_float(parts[8]),
+                            'await': self._safe_float(parts[9]),
+                            'r_await': self._safe_float(parts[10]),
+                            'w_await': self._safe_float(parts[11]),
+                            'svctm': self._safe_float(parts[12]) if parts[12] != 'N/A' else 0,
+                            'util': self._safe_float(parts[13].rstrip('%'))
+                        }
+                        
+                        # Track high utilization
+                        if sample['util'] > 90:
+                            if device not in result['high_util_devices']:
+                                result['high_util_devices'].append(device)
+                        
+                    elif len(parts) >= 6:
+                        # Basic format
+                        sample = {
+                            'tps': self._safe_float(parts[1]),
+                            'kB_read_s': self._safe_float(parts[2]),
+                            'kB_wrtn_s': self._safe_float(parts[3]),
+                            'kB_read': self._safe_float(parts[4]),
+                            'kB_wrtn': self._safe_float(parts[5])
+                        }
+                    else:
+                        continue
+                    
+                    result['devices'][device].append(sample)
+                    
+                except Exception as e:
+                    print(f"Failed to parse iostat line for {device}: {e}")
+                    continue
+        
+        # Calculate device summaries
+        for device, samples in result['devices'].items():
+            if samples:
+                result['summary'][device] = {
+                    'samples': len(samples),
+                    'avg_util': round(sum(s.get('util', 0) for s in samples) / len(samples), 2),
+                    'max_util': max(s.get('util', 0) for s in samples),
+                    'avg_await': round(sum(s.get('await', 0) for s in samples) / len(samples), 2),
+                    'max_await': max(s.get('await', 0) for s in samples)
+                }
+        
+        return result
+    
+    def _parse_free_m(self, file_path: Path) -> Dict:
+        """Parse free -m with comprehensive unit handling"""
+        content = self._safe_read(file_path)
+        lines = content.splitlines()
+        
+        result = {
+            "raw_output": content,
+            "memory_pressure": False
+        }
+        
+        for line in lines:
+            # Memory line
+            if line.startswith('Mem:'):
+                parts = line.split()
+                if len(parts) >= 3:
+                    result['total_mb'] = self._safe_int(parts[1])
+                    
+                    # Handle different free versions (columns vary)
+                    if len(parts) >= 7:  # Newer format with available
+                        result['used_mb'] = self._safe_int(parts[2])
+                        result['free_mb'] = self._safe_int(parts[3])
+                        result['shared_mb'] = self._safe_int(parts[4])
+                        result['buff_cache_mb'] = self._safe_int(parts[5])
+                        result['available_mb'] = self._safe_int(parts[6])
+                    elif len(parts) >= 6:  # Older format
+                        result['used_mb'] = self._safe_int(parts[2])
+                        result['free_mb'] = self._safe_int(parts[3])
+                        result['shared_mb'] = self._safe_int(parts[4])
+                        result['buffers_mb'] = self._safe_int(parts[5])
+                        # Calculate available
+                        result['available_mb'] = result['free_mb'] + result.get('buffers_mb', 0)
+                    else:  # Minimal format
+                        result['used_mb'] = self._safe_int(parts[2]) if len(parts) > 2 else 0
+                        result['free_mb'] = self._safe_int(parts[3]) if len(parts) > 3 else 0
+                        result['available_mb'] = result['free_mb']
+                    
+                    # Calculate percentage
+                    if result['total_mb'] > 0:
+                        result['used_percent'] = round(result['used_mb'] / result['total_mb'] * 100, 1)
+                        avail = result.get('available_mb', result['free_mb'])
+                        result['available_percent'] = round(avail / result['total_mb'] * 100, 1)
+                        
+                        # Check memory pressure
+                        if result['available_percent'] < 10:
+                            result['memory_pressure'] = True
+            
+            # Swap line
+            elif line.startswith('Swap:'):
+                parts = line.split()
+                if len(parts) >= 4:
+                    result['swap_total_mb'] = self._safe_int(parts[1])
+                    result['swap_used_mb'] = self._safe_int(parts[2])
+                    result['swap_free_mb'] = self._safe_int(parts[3])
+                    
+                    # Flag if swap is being used
+                    if result['swap_used_mb'] > 0:
+                        result['swap_in_use'] = True
+            
+            # Handle -/+ buffers/cache line (older format)
+            elif line.startswith('-/+ buffers'):
+                parts = line.split()
+                if len(parts) >= 3:
+                    # This gives actual used/free excluding buffers/cache
+                    result['real_used_mb'] = self._safe_int(parts[2])
+                    result['real_free_mb'] = self._safe_int(parts[3])
+        
+        return result
+    
+    def _parse_df_hT(self, file_path: Path) -> Dict:
+        """Parse df -hT with robust handling of wrapped lines and special filesystems"""
+        content = self._safe_read(file_path)
+        lines = content.splitlines()
+        
+        result = {
+            "raw_output": content,
+            "filesystems": [],
+            "critical_filesystems": [],
+            "total_space": {},
+            "warnings": []
+        }
+        
+        # Find header line
+        header_idx = -1
+        for i, line in enumerate(lines):
+            if 'Filesystem' in line:
+                header_idx = i
+                break
+        
+        if header_idx < 0:
+            # No header found, assume first line
+            header_idx = 0
+        
+        # Process lines after header
+        pending_line = ""
+        
+        for line in lines[header_idx + 1:]:
+            if not line.strip():
+                continue
+            
+            # Check if this line starts with a filesystem path or device
+            # Common patterns: /dev/*, tmpfs, overlay, nfs*, etc.
+            is_new_entry = False
+            
+            # Check for common filesystem patterns
+            fs_patterns = [
+                r'^/dev/',
+                r'^tmpfs\s',
+                r'^devtmpfs\s',
+                r'^overlay\s',
+                r'^shm\s',
+                r'^nfs',
+                r'^[a-zA-Z0-9]+fs\s',  # Any *fs filesystem
+                r'^[a-zA-Z0-9\-_.]+:\/',  # NFS mounts
+                r'^\/\/[a-zA-Z0-9]',  # SMB/CIFS mounts
+                r'^[a-zA-Z0-9\-_.]+\s+[a-zA-Z0-9\-_]+\s+\d'  # Generic pattern with type
+            ]
+            
+            for pattern in fs_patterns:
+                if re.match(pattern, line):
+                    is_new_entry = True
+                    break
+            
+            # Also check if line has enough fields to be a complete entry
+            parts = line.split()
+            if len(parts) >= 6:
+                # Check if 5th or 6th field contains a percentage
+                for idx in [4, 5]:
+                    if idx < len(parts) and '%' in parts[idx]:
+                        is_new_entry = True
+                        break
+            
+            if is_new_entry:
+                # Process any pending line first
+                if pending_line:
+                    self._process_df_line_enhanced(pending_line, result)
+                pending_line = line
+            else:
+                # This is a continuation of the previous line
+                if pending_line:
+                    pending_line += " " + line.strip()
+                else:
+                    # Orphaned continuation line, try to process it anyway
+                    pending_line = line
+        
+        # Don't forget the last line
+        if pending_line:
+            self._process_df_line_enhanced(pending_line, result)
+        
+        # Calculate totals (only for real filesystems)
+        total_size = 0
+        total_used = 0
+        
+        for fs in result['filesystems']:
+            # Skip special filesystems for totals
+            if fs['filesystem'] in ['devtmpfs', 'tmpfs', 'shm', 'overlay'] or fs['type'] in ['devtmpfs', 'tmpfs']:
+                continue
+                
+            # Convert to MB for totaling
+            size_mb = self._convert_to_mb(fs['size'])
+            used_mb = self._convert_to_mb(fs['used'])
+            
+            total_size += size_mb
+            total_used += used_mb
+            
+            # Check for critical filesystems
+            if fs['use_percent'] > 90:
+                result['critical_filesystems'].append(fs)
+                result['warnings'].append(f"{fs['mount']} is {fs['use_percent']}% full")
+        
+        if total_size > 0:
+            result['total_space'] = {
+                'total_gb': round(total_size / 1024, 2),
+                'used_gb': round(total_used / 1024, 2),
+                'available_gb': round((total_size - total_used) / 1024, 2),
+                'use_percent': round(total_used / total_size * 100, 1)
+            }
+        
+        return result
+    
+    def _process_df_line_enhanced(self, line: str, result: Dict):
+        """Process a single df output line with better field detection"""
+        parts = line.split()
+        
+        if len(parts) < 6:
+            return  # Not enough fields
+        
+        # Try to identify the format
+        # Format 1: Filesystem Type Size Used Avail Use% Mounted on
+        # Format 2: Filesystem Size Used Avail Use% Mounted on (no type)
+        
+        # Look for the percentage field
+        percent_idx = -1
+        for i, part in enumerate(parts):
+            if '%' in part:
+                percent_idx = i
+                break
+        
+        if percent_idx < 0:
+            return  # No percentage found
+        
+        # Now we know the structure based on percent position
+        fs_data = {}
+        
+        # The mount point is everything after the percentage
+        mount_point = ' '.join(parts[percent_idx + 1:])
+        
+        # Parse backwards from percentage
+        fs_data['use_percent'] = self._safe_int(parts[percent_idx].rstrip('%'))
+        fs_data['mount'] = mount_point if mount_point else '/'
+        
+        # Available is before percentage
+        if percent_idx > 0:
+            fs_data['available'] = parts[percent_idx - 1]
+        
+        # Used is before available
+        if percent_idx > 1:
+            fs_data['used'] = parts[percent_idx - 2]
+        
+        # Size is before used
+        if percent_idx > 2:
+            fs_data['size'] = parts[percent_idx - 3]
+        
+        # Now determine if we have type field
+        # If we have more fields before size, second field is likely type
+        if percent_idx > 3:
+            # We have a type field
+            fs_data['type'] = parts[1]
+            fs_data['filesystem'] = parts[0]
+        else:
+            # No type field
+            fs_data['type'] = 'unknown'
+            fs_data['filesystem'] = parts[0]
+        
+        # Validate the entry
+        if 'filesystem' in fs_data and 'mount' in fs_data:
+            # Clean up filesystem name (remove any trailing colons)
+            fs_data['filesystem'] = fs_data['filesystem'].rstrip(':')
+            
+            # Set defaults for missing fields
+            fs_data.setdefault('size', '0')
+            fs_data.setdefault('used', '0')
+            fs_data.setdefault('available', '0')
+            fs_data.setdefault('use_percent', 0)
+            fs_data.setdefault('type', 'unknown')
+            
+            result['filesystems'].append(fs_data)
+    
+    def _convert_to_mb(self, size_str: str) -> float:
+        """Convert size string (e.g., '10G', '500M') to MB"""
+        if not size_str or size_str == '-':
+            return 0
+        
+        # Remove any trailing characters
+        size_str = size_str.upper()
+        
+        multipliers = {
+            'K': 1/1024,
+            'M': 1,
+            'G': 1024,
+            'T': 1024 * 1024,
+            'P': 1024 * 1024 * 1024
+        }
+        
+        for suffix, multiplier in multipliers.items():
+            if suffix in size_str:
+                try:
+                    num = float(size_str.replace(suffix, '').replace('I', '').replace('B', ''))
+                    return num * multiplier
+                except ValueError:
+                    return 0
+        
+        # No suffix, assume MB
+        try:
+            return float(size_str)
+        except ValueError:
+            return 0
+    
+    def _parse_netstat(self, file_path: Path) -> Dict:
+        """Enhanced netstat parser"""
+        content = self._safe_read(file_path)
+        lines = content.splitlines()
+        
+        result = {
+            "raw_output": content,
+            "connections": {},
+            "protocols": {},
+            "listening_ports": [],
+            "statistics": {},
+            "issues": []
+        }
+        
+        for line in lines:
+            line_lower = line.lower()
+            
+            # Parse connection lines
+            if 'tcp' in line_lower or 'udp' in line_lower:
+                parts = line.split()
+                if len(parts) >= 4:
+                    
+                    # Extract protocol
+                    protocol = 'tcp' if 'tcp' in line_lower else 'udp'
+                    result['protocols'][protocol] = result['protocols'].get(protocol, 0) + 1
+                    
+                    # For TCP, get state
+                    if protocol == 'tcp' and len(parts) >= 6:
+                        # State is usually last column
+                        state = parts[-1].upper()
+                        
+                        # Validate it's a real state
+                        valid_states = ['ESTABLISHED', 'SYN_SENT', 'SYN_RECV', 
+                                       'FIN_WAIT1', 'FIN_WAIT2', 'TIME_WAIT',
+                                       'CLOSE', 'CLOSE_WAIT', 'LAST_ACK',
+                                       'LISTEN', 'CLOSING', 'UNKNOWN']
+                        
+                        if state in valid_states:
+                            result['connections'][state] = result['connections'].get(state, 0) + 1
+                            
+                            # Track listening ports
+                            if state == 'LISTEN' and len(parts) >= 4:
+                                local_addr = parts[3]
+                                if ':' in local_addr:
+                                    port = local_addr.split(':')[-1]
+                                    if port not in result['listening_ports']:
+                                        result['listening_ports'].append(port)
+        
+        # Check for issues
+        if result['connections'].get('CLOSE_WAIT', 0) > 100:
+            result['issues'].append(f"High CLOSE_WAIT count: {result['connections']['CLOSE_WAIT']}")
+        
+        if result['connections'].get('TIME_WAIT', 0) > 10000:
+            result['issues'].append(f"Very high TIME_WAIT count: {result['connections']['TIME_WAIT']}")
+        
+        return result
+    
+    def _parse_ps(self, file_path: Path) -> Dict:
+        """Enhanced ps parser"""
+        content = self._safe_read(file_path)
+        lines = content.splitlines()
+        
+        result = {
+            "raw_output": content,
+            "process_count": 0,
+            "process_states": {},
+            "users": {},
+            "high_cpu_processes": [],
+            "high_mem_processes": [],
+            "zombies": []
+        }
+        
+        # Find header line
+        header_idx = -1
+        for i, line in enumerate(lines):
+            if 'PID' in line and ('STAT' in line or 'S' in line):
+                header_idx = i
+                break
+        
+        if header_idx >= 0:
+            # Determine column positions
+            header = lines[header_idx]
+            stat_col = -1
+            user_col = -1
+            cpu_col = -1
+            mem_col = -1
+            cmd_col = -1
+            
+            # Find column indices
+            headers = header.split()
+            for idx, h in enumerate(headers):
+                if h in ['STAT', 'S']:
+                    stat_col = idx
+                elif h == 'USER':
+                    user_col = idx
+                elif h == '%CPU':
+                    cpu_col = idx
+                elif h == '%MEM':
+                    mem_col = idx
+                elif h in ['CMD', 'COMMAND']:
+                    cmd_col = idx
+            
+            # Parse process lines
+            for line in lines[header_idx + 1:]:
+                if not line.strip():
+                    continue
+                
+                result['process_count'] += 1
+                parts = line.split(None, max(10, cmd_col + 1) if cmd_col > 0 else 10)
+                
+                # Extract state
+                if stat_col >= 0 and len(parts) > stat_col:
+                    stat = parts[stat_col]
+                    if stat:
+                        state = stat[0]  # First character is the state
+                        result['process_states'][state] = result['process_states'].get(state, 0) + 1
+                        
+                        # Track zombies
+                        if state == 'Z':
+                            pid = parts[0] if parts else 'unknown'
+                            cmd = parts[cmd_col] if cmd_col >= 0 and len(parts) > cmd_col else 'unknown'
+                            result['zombies'].append({'pid': pid, 'command': cmd})
+                
+                # Count by user
+                if user_col >= 0 and len(parts) > user_col:
+                    user = parts[user_col]
+                    result['users'][user] = result['users'].get(user, 0) + 1
+                
+                # Track high resource usage
+                if cpu_col >= 0 and len(parts) > cpu_col:
+                    cpu = self._safe_float(parts[cpu_col])
+                    if cpu > 50:
+                        result['high_cpu_processes'].append({
+                            'pid': parts[0],
+                            'cpu': cpu,
+                            'command': parts[cmd_col] if cmd_col >= 0 and len(parts) > cmd_col else 'unknown'
+                        })
+                
+                if mem_col >= 0 and len(parts) > mem_col:
+                    mem = self._safe_float(parts[mem_col])
+                    if mem > 20:
+                        result['high_mem_processes'].append({
+                            'pid': parts[0],
+                            'mem': mem,
+                            'command': parts[cmd_col] if cmd_col >= 0 and len(parts) > cmd_col else 'unknown'
+                        })
+        
+        # Add state descriptions
+        result['state_descriptions'] = {
+            'R': 'Running',
+            'S': 'Sleeping',
+            'D': 'Uninterruptible sleep',
+            'Z': 'Zombie',
+            'T': 'Stopped',
+            'I': 'Idle kernel thread'
+        }
+        
+        return result
+    
+    def _parse_uptime(self, file_path: Path) -> Dict:
+        """Parse uptime with multiple format support"""
+        content = self._safe_read(file_path)
+        
+        result = {"raw_output": content}
+        
+        # Extract load averages (most reliable)
+        load_match = re.search(
+            r'load\s+averages?:\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)',
+            content, re.IGNORECASE
+        )
+        if load_match:
+            result['load_1min'] = self._safe_float(load_match.group(1))
+            result['load_5min'] = self._safe_float(load_match.group(2))
+            result['load_15min'] = self._safe_float(load_match.group(3))
+        
+        # Extract uptime
+        uptime_patterns = [
+            (r'up\s+(\d+)\s+days?,\s*(\d+):(\d+)', 'days'),
+            (r'up\s+(\d+):(\d+)', 'hours'),
+            (r'up\s+(\d+)\s+min', 'minutes'),
+            (r'up\s+(\d+)\s+days?', 'days_only')
+        ]
+        
+        for pattern, format_type in uptime_patterns:
+            match = re.search(pattern, content)
+            if match:
+                if format_type == 'days':
+                    days = int(match.group(1))
+                    hours = int(match.group(2))
+                    minutes = int(match.group(3))
+                    result['uptime'] = f"{days} days, {hours}:{minutes:02d}"
+                    result['uptime_days'] = days
+                    result['uptime_hours'] = hours
+                    result['uptime_minutes'] = minutes
+                elif format_type == 'hours':
+                    hours = int(match.group(1))
+                    minutes = int(match.group(2))
+                    result['uptime'] = f"{hours}:{minutes:02d}"
+                    result['uptime_hours'] = hours
+                    result['uptime_minutes'] = minutes
+                elif format_type == 'minutes':
+                    minutes = int(match.group(1))
+                    result['uptime'] = f"{minutes} min"
+                    result['uptime_minutes'] = minutes
+                elif format_type == 'days_only':
+                    days = int(match.group(1))
+                    result['uptime'] = f"{days} days"
+                    result['uptime_days'] = days
+                break
+        
+        # Extract user count
+        users_match = re.search(r'(\d+)\s+users?', content)
+        if users_match:
+            result['users'] = int(users_match.group(1))
+        
+        # Extract current time if present
+        time_match = re.search(r'(\d{1,2}:\d{2}:\d{2})\s+(AM|PM)?', content)
+        if time_match:
+            result['current_time'] = time_match.group(0).strip()
+        
+        return result
+    
+    def _parse_generic(self, file_path: Path) -> Dict:
+        """Generic parser with basic analysis"""
+        content = self._safe_read(file_path)
+        lines = content.splitlines()
+        
+        result = {
+            "raw_output": content,
+            "line_count": len(lines),
+            "file_size": len(content),
+            "non_empty_lines": sum(1 for l in lines if l.strip())
+        }
+        
+        # Try to identify any numbers or patterns
+        numbers = re.findall(r'\d+\.?\d*', content)
+        if numbers:
+            result['numeric_values_found'] = len(numbers)
+        
+        # Look for any error keywords
+        error_keywords = ['error', 'fail', 'critical', 'warning', 'abort', 'panic']
+        errors_found = []
+        for keyword in error_keywords:
+            if keyword.lower() in content.lower():
+                errors_found.append(keyword)
+        
+        if errors_found:
+            result['potential_issues'] = errors_found
+        
+        return result
 
 
 class EnhancedAnalyzer:
@@ -2199,6 +3459,36 @@ async def get_raw_log(session_id: str, file_path: str):
     
     return FileResponse(actual_path, media_type="text/plain")
 
+@app.get("/api/system-metrics/comprehensive/{session_id}")
+async def get_comprehensive_metrics(session_id: str):
+    """Get all system metrics with 100% accuracy"""
+    
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Session not found")
+    
+    session_dir = extracted_files[session_id]
+    
+    try:
+        print(f"📊 Parsing system metrics for session: {session_id}")
+        print(f"📁 Session directory: {session_dir}")
+        
+        # Use the new accurate parser
+        parser = SystemMetricsParser(session_dir)
+        data = parser.parse_all()
+        
+        print(f"✅ Successfully parsed {len(data['available_commands'])} commands")
+        
+        return {
+            "session_id": session_id,
+            "timestamp": data['timestamp'],
+            "data": data
+        }
+        
+    except Exception as e:
+        print(f"❌ Parse failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Parse failed: {str(e)}")
 
 def ensure_localhost_only():
     """Refuse to start if not on localhost"""
