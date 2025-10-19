@@ -11,6 +11,9 @@ import DuoChatWidget from './components/DuoChatWidget';
 import FastStatsDashboard from './components/FastStatsDashboard';
 import AutoAnalysis from './components/AutoAnalysis';
 import SystemMetrics from './components/SystemMetrics';
+import EnhancedLogViewer from './components/EnhancedLogViewer';
+
+
 
 
 
@@ -870,7 +873,7 @@ const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
 // Replace EnhancedLogViewer in App.jsx with this SIMPLE version
 // NO LazyLog, NO new dependencies, just prevents freezing
 
-const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }) => {
+const EnhancedLogViewer1 = ({ sessionId, analysisData, initialFile, initialLine }) => {
     const [selectedFile, setSelectedFile] = useState(initialFile);
     const [fileContent, setFileContent] = useState(null);
     const [loading, setLoading] = useState(false);
