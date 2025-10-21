@@ -17,13 +17,13 @@ import re
 class GitLabDuoChatIntegration:
     def __init__(self):
         # Environment variables
-        self.pat = os.environ.get('GITLAB_PAT')
+        self.gitlab_token = os.environ.get('GITLAB_TOKEN') or os.environ.get('GITLAB_PAT')
         self.gitlab_url = os.environ.get('GITLAB_INSTANCE_URL', 'https://gitlab.com')
         self.user_id = os.environ.get('GITLAB_USER_ID')  # Can be auto-detected
         
-        if not self.pat:
-            print("⚠️  GITLAB_PAT not found. GitLab Duo features will be disabled.")
-            print("   Set it using: export GITLAB_PAT='your-token-here'")
+        if not self.gitlab_token:
+            print("⚠️  GITLAB_TOKEN not found. GitLab Duo features will be disabled.")
+            print("   Set it using: export GITLAB_TOKEN='your-token-here'")
             self.enabled = False
         else:
             self.enabled = True
@@ -42,7 +42,7 @@ class GitLabDuoChatIntegration:
         
         # Headers
         self.headers = {
-            'Authorization': f'Bearer {self.pat}',
+            'Authorization': f'Bearer {self.gitlab_token}',
             'Content-Type': 'application/json'
         }
         
@@ -65,7 +65,7 @@ class GitLabDuoChatIntegration:
             session = await self.get_session()
             async with session.get(
                 f"{self.gitlab_url}/api/v4/user",
-                headers={'Authorization': f'Bearer {self.pat}'}
+                headers={'Authorization': f'Bearer {self.gitlab_token}'}
             ) as response:
                 if response.status == 200:
                     user_data = await response.json()
@@ -116,8 +116,8 @@ class GitLabDuoChatIntegration:
             return {
                 'requestId': str(uuid.uuid4()),
                 'threadId': thread_id or f"local_{session_id}",
-                'response': "GitLab Duo Chat is not available. Please set the GITLAB_PAT environment variable.",
-                'errors': ['GITLAB_PAT not configured']
+                'response': "GitLab Duo Chat is not available. Please set the GITLAB_TOKEN environment variable.",
+                'errors': ['GITLAB_TOKEN not configured']
             }
         
         # Ensure user ID is detected
@@ -170,7 +170,7 @@ class GitLabDuoChatIntegration:
                     raise Exception("GraphQL endpoint not found")
                 
                 if response.status == 403:
-                    raise Exception("Access denied. Check your PAT token permissions")
+                    raise Exception("Access denied. Check your TOKEN token permissions")
                 
                 data = await response.json()
                 
@@ -368,10 +368,10 @@ class GitLabDuoChatIntegration:
         if not self.enabled:
             return {
                 'thread_id': f"local_{session_id}",
-                'response': "GitLab Duo Chat is not available. Please set the GITLAB_PAT environment variable.",
+                'response': "GitLab Duo Chat is not available. Please set the GITLAB_TOKEN environment variable.",
                 'context_used': False,
                 'session_id': session_id,
-                'error': 'GITLAB_PAT not configured'
+                'error': 'GITLAB_TOKEN not configured'
             }
         
         response = await self.send_chat_message(query, session_id)

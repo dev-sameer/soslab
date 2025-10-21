@@ -226,7 +226,13 @@ NOT level:debug
 
 **Setup:**
 ```bash
-# Set your GitLab PAT before starting
+# Set your GitLab token before starting (new)
+export GITLAB_TOKEN="glpat-YOUR_ACTUAL_TOKEN_HERE"
+python start.py
+```
+
+```bash
+# Set your GitLab token before starting (old method using GITLAB_PAT)
 export GITLAB_PAT="glpat-YOUR_ACTUAL_TOKEN_HERE"
 python start.py
 ```
