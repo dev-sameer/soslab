@@ -3227,50 +3227,28 @@ async def start_auto_analysis(session_id: str, background_tasks: BackgroundTasks
     }
 
 # OPTIMIZED run_auto_analysis_task function
+# Replace the entire run_auto_analysis_task function with this COMPLETE version
+
 async def run_auto_analysis_task(session_id: str):
-    """Background task to run auto-analysis using autogrep.py - OPTIMIZED VERSION"""
+    """Background task to run auto-analysis - COMPLETE DATA EXTRACTION"""
     try:
         print(f"🔍 Starting auto-analysis for session: {session_id}")
         
-        # Update status
         auto_analysis_sessions[session_id].update({
             "status": "processing",
             "progress": 10,
             "message": "Initializing pattern hunter..."
         })
         
-        # OPTIMIZATION: More efficient file finding
+        # Find original file
         upload_path = Path("data/uploads")
-        
-        # Build a list of potential files more efficiently
-        potential_files = []
-        
-        # Use glob more efficiently with specific patterns
-        # First, try exact match with session_id
-        pattern1 = f"*{session_id}*"
-        potential_files.extend(upload_path.glob(pattern1))
-        
-        # If not found, extract the original filename from session_id
-        if not potential_files:
-            parts = session_id.split('_', 2)
-            if len(parts) > 2:
-                original_filename = parts[2]
-                pattern2 = f"*{original_filename}"
-                potential_files.extend(upload_path.glob(pattern2))
-        
-        # Use the first valid file found
         original_file = None
-        for file in potential_files:
-            if file.exists() and file.is_file():
+        
+        # Try exact match first
+        for file in upload_path.iterdir():
+            if session_id in file.name and file.is_file():
                 original_file = file
                 break
-        
-        if not original_file:
-            # Fallback to listing all files if patterns didn't work
-            for file in upload_path.iterdir():
-                if session_id in file.name and file.is_file():
-                    original_file = file
-                    break
         
         if not original_file:
             raise Exception(f"Original uploaded file not found for session {session_id}")
@@ -3279,24 +3257,21 @@ async def run_auto_analysis_task(session_id: str):
         
         auto_analysis_sessions[session_id].update({
             "progress": 30,
-            "message": "Running pattern analysis on original archive..."
+            "message": "Running pattern analysis..."
         })
         
-        # Run the analysis with optimizations
         def run_analysis():
             print(f"🎯 Initializing AutoGrep...")
-            # OPTIMIZATION: Use more workers for better parallelization
-            optimal_workers = min(mp.cpu_count(), 8)  # Increased from 4
+            optimal_workers = min(mp.cpu_count(), 8)
             analyzer = AutoGrep(workers=optimal_workers)
-            print(f"✅ AutoGrep initialized with {len(analyzer.pattern_bank.patterns)} patterns, using {optimal_workers} workers")
+            print(f"✅ AutoGrep initialized with {len(analyzer.pattern_bank.patterns)} patterns")
             
             auto_analysis_sessions[session_id].update({
                 "progress": 50,
                 "message": "Analyzing patterns..."
             })
             
-            # Run the analysis - AutoGrep returns a report dict
-            print(f"🔍 Starting pattern analysis on: {original_file}")
+            # Run analysis
             start_time = time.time()
             report = analyzer.analyze_tar(str(original_file))
             analysis_duration = time.time() - start_time
@@ -3307,58 +3282,136 @@ async def run_auto_analysis_task(session_id: str):
                 "message": "Processing results..."
             })
             
-            # Convert AutoGrep report format to match frontend expectations
-            problems = []
-            rank = 1
+            # CRITICAL FIX: Extract ALL problems from ALL error clusters
+            all_problems = []
+            problem_rank = 1
             
-            # Process GitLab components from the report
+            # Process error_clusters from AutoGrep (the main GitLab errors)
+            if hasattr(analyzer, 'error_clusters'):
+                for component, clusters in analyzer.error_clusters.items():
+                    for signature, errors in clusters:
+                        if errors:
+                            sample = errors[0]
+                            
+                            # Get unique files
+                            unique_files = list(set(
+                                os.path.basename(e.file_path) for e in errors[:10]
+                            ))
+                            
+                            all_problems.append({
+                                "rank": problem_rank,
+                                "component": component,
+                                "pattern": sample.pattern.pattern[:200],
+                                "pattern_id": sample.pattern.id,
+                                "severity": sample.pattern.severity,
+                                "description": sample.pattern.description or "",
+                                "count": len(errors),
+                                "files": unique_files,
+                                "sample_line": sample.line[:500],
+                                "sample_file": unique_files[0] if unique_files else "unknown",
+                                "signature": signature,
+                                "is_monitoring": False
+                            })
+                            problem_rank += 1
+            
+            # Also check the report's gitlab_components for any missed patterns
             gitlab_components = report.get('gitlab_components', {})
             for component, issues in gitlab_components.items():
-                for issue in issues[:10]:  # Limit to top 10 per component
-                    problems.append({
-                        "rank": rank,
-                        "component": component,
-                        "pattern": issue.get('pattern', ''),
-                        "count": issue.get('count', 0),
-                        "nodes": [],  # AutoGrep doesn't track nodes the same way
-                        "files": issue.get('files', []),
-                        "first_seen": None,
-                        "last_seen": None,
-                        "sample_line": issue.get('sample', ''),
-                        "sample_file": issue.get('files', ['unknown'])[0] if issue.get('files') else 'unknown',
-                        "line_number": 0,  # AutoGrep doesn't provide line numbers in summary
-                        "error_category": component.lower().replace('/', '_').replace(' ', '_'),
-                        "cluster_signature": f"{component}_{issue.get('pattern_id', rank)}"
-                    })
-                    rank += 1
-                    if rank > 50:  # Max 50 problems total
-                        break
-                if rank > 50:
-                    break
+                for issue in issues:
+                    # Check if we already have this pattern
+                    pattern_id = issue.get('pattern_id', '')
+                    if not any(p['pattern_id'] == pattern_id and p['component'] == component 
+                              for p in all_problems):
+                        all_problems.append({
+                            "rank": problem_rank,
+                            "component": component,
+                            "pattern": issue.get('pattern', '')[:200],
+                            "pattern_id": pattern_id,
+                            "severity": issue.get('severity', 'ERROR'),
+                            "description": issue.get('description', ''),
+                            "count": issue.get('count', 0),
+                            "files": issue.get('files', []),
+                            "sample_line": issue.get('sample', ''),
+                            "sample_file": issue.get('files', ['unknown'])[0] if issue.get('files') else 'unknown',
+                            "signature": f"{component}_{pattern_id}",
+                            "is_monitoring": False
+                        })
+                        problem_rank += 1
             
-            # Build component stats
-            component_stats = report.get('summary', {}).get('component_counts', {})
+            # Process monitoring errors separately
+            monitoring_problems = []
+            if hasattr(analyzer, 'monitoring_clusters'):
+                for component, clusters in analyzer.monitoring_clusters.items():
+                    for signature, errors in clusters:
+                        if errors:
+                            sample = errors[0]
+                            unique_files = list(set(
+                                os.path.basename(e.file_path) for e in errors[:10]
+                            ))
+                            
+                            monitoring_problems.append({
+                                "component": component,
+                                "pattern": sample.pattern.pattern[:200],
+                                "pattern_id": sample.pattern.id,
+                                "severity": sample.pattern.severity,
+                                "description": sample.pattern.description or "",
+                                "count": len(errors),
+                                "files": unique_files,
+                                "sample_line": sample.line[:500],
+                                "is_monitoring": True
+                            })
             
-            # Get monitoring stats if available
-            monitoring_stats = report.get('monitoring_summary', {})
-            
-            # Process summary data
+            # Get summary data
             summary = report.get('summary', {})
             
+            # Build component statistics from actual problems
+            component_stats = {}
+            for problem in all_problems:
+                comp = problem['component']
+                if comp not in component_stats:
+                    component_stats[comp] = 0
+                component_stats[comp] += problem['count']
+            
+            # Calculate severity breakdown from actual problems
+            severity_breakdown = {"CRITICAL": 0, "ERROR": 0, "WARNING": 0}
+            for problem in all_problems:
+                severity = problem['severity'].upper()
+                if severity in severity_breakdown:
+                    severity_breakdown[severity] += problem['count']
+            
+            print(f"📊 Extracted {len(all_problems)} GitLab problem patterns")
+            print(f"📊 Extracted {len(monitoring_problems)} monitoring patterns")
+            
             return {
+                # Core metrics from summary
                 "analysis_duration": analysis_duration,
                 "total_problems": summary.get('errors_found', 0),
                 "gitlab_problems": summary.get('gitlab_errors', 0),
                 "monitoring_issues": summary.get('monitoring_errors', 0),
-                "unique_patterns": len(problems),
-                "problems": problems,
+                "unique_patterns": len(all_problems),
+                
+                # ALL problems
+                "problems": all_problems,
+                "monitoring_problems": monitoring_problems,
+                
+                # Statistics
                 "component_stats": component_stats,
-                "monitoring_stats": monitoring_stats,
-                "correlation_ids": 0,  # AutoGrep doesn't expose this
-                "repository_errors": 0   # AutoGrep doesn't expose this
+                "monitoring_stats": summary.get('monitoring_summary', {}),
+                "severity_breakdown": severity_breakdown,
+                
+                # Summary data
+                "summary": summary,
+                
+                # Metadata
+                "metadata": {
+                    "files_processed": summary.get('files_processed', 0),
+                    "lines_processed": summary.get('lines_processed', 0),
+                    "analysis_duration_seconds": analysis_duration,
+                    "pattern_bank_size": len(analyzer.pattern_bank.patterns) if hasattr(analyzer, 'pattern_bank') else 0
+                }
             }
         
-        # Run in thread pool to avoid blocking
+        # Run in thread pool
         loop = asyncio.get_event_loop()
         results_data = await loop.run_in_executor(thread_pool, run_analysis)
         
@@ -3372,17 +3425,19 @@ async def run_auto_analysis_task(session_id: str):
         })
         
         print(f"✅ Auto-analysis completed for session: {session_id}")
-        print(f"   📊 Results: {results_data['total_problems']} problems, {results_data['unique_patterns']} patterns")
+        print(f"   📊 Total: {results_data['total_problems']} problems found")
+        print(f"   🎯 GitLab: {results_data['gitlab_problems']} ({len(results_data['problems'])} patterns)")
+        print(f"   📡 Monitoring: {results_data['monitoring_issues']} ({len(results_data.get('monitoring_problems', []))} patterns)")
         
     except Exception as e:
-        print(f"❌ Auto-analysis failed for session {session_id}: {e}")
+        print(f"❌ Auto-analysis failed: {e}")
         import traceback
         traceback.print_exc()
         
         auto_analysis_sessions[session_id].update({
             "status": "failed",
             "progress": 0,
-            "message": f"Auto-analysis failed: {str(e)}",
+            "message": f"Failed: {str(e)}",
             "error": str(e),
             "failed_at": datetime.now().isoformat()
         })
@@ -3489,6 +3544,448 @@ async def get_comprehensive_metrics(session_id: str):
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Parse failed: {str(e)}")
+
+# Add this new endpoint to main.py - keeps existing endpoints intact
+@app.get("/api/logs/{session_id}/{file_path:path}/metadata")
+async def get_log_metadata(session_id: str, file_path: str):
+    """Get file metadata without loading all content - for performance"""
+    
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Session not found")
+    
+    session_dir = extracted_files[session_id]
+    actual_path = session_dir / file_path
+    
+    if not actual_path.exists():
+        raise HTTPException(404, f"Log file not found: {file_path}")
+    
+    try:
+        # Quick line count without loading everything
+        line_count = 0
+        json_count = 0
+        file_size = actual_path.stat().st_size
+        
+        # Sample first 100 lines for JSON detection
+        with open(actual_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for i, line in enumerate(f):
+                line_count += 1
+                if i < 100 and line.strip().startswith('{'):
+                    try:
+                        json.loads(line)
+                        json_count += 1
+                    except:
+                        pass
+        
+        is_json = json_count > 30  # >30% of sample is JSON
+        
+        return {
+            "file": file_path,
+            "total_lines": line_count,
+            "file_size": file_size,
+            "is_json_log": is_json,
+            "should_virtualize": line_count > 10000  # Virtualize large files
+        }
+        
+    except Exception as e:
+        raise HTTPException(500, f"Error reading metadata: {str(e)}")
+
+# Enhanced Backend API Endpoints for Production Log Search
+# Add these to your FastAPI backend
+
+import json
+import os
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from fastapi import HTTPException, Query
+from fastapi.responses import StreamingResponse, FileResponse
+import asyncio
+
+# Enhanced metadata endpoint with better JSON detection
+@app.get("/api/logs/{session_id}/{file_path:path}/metadata")
+async def get_log_metadata(session_id: str, file_path: str):
+    """Get file metadata with enhanced JSON detection"""
+    
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Session not found")
+    
+    session_dir = extracted_files[session_id]
+    actual_path = session_dir / file_path
+    
+    if not actual_path.exists():
+        raise HTTPException(404, f"Log file not found: {file_path}")
+    
+    try:
+        line_count = 0
+        json_count = 0
+        file_size = actual_path.stat().st_size
+        json_fields = set()
+        
+        # Enhanced sampling - check more lines for better detection
+        sample_size = min(500, file_size // 1000)  # Sample more lines for large files
+        
+        with open(actual_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for i, line in enumerate(f):
+                line_count += 1
+                if i < sample_size:
+                    line_stripped = line.strip()
+                    if line_stripped.startswith('{') and line_stripped.endswith('}'):
+                        try:
+                            parsed = json.loads(line)
+                            json_count += 1
+                            json_fields.update(parsed.keys())
+                        except:
+                            pass
+        
+        # Better JSON detection logic
+        is_json = (
+            json_count > sample_size * 0.1 or  # >10% JSON
+            file_path.endswith('.json') or 
+            'json' in file_path.lower() or
+            (json_count > 5 and len(json_fields) > 3)  # Has structured JSON
+        )
+        
+        return {
+            "file": file_path,
+            "total_lines": line_count,
+            "file_size": file_size,
+            "is_json_log": is_json,
+            "detected_fields": list(json_fields)[:50],  # Return top 50 fields
+            "json_ratio": json_count / max(sample_size, 1),
+            "should_virtualize": line_count > 5000,  # Lower threshold for virtualization
+            "recommended_chunk_size": min(10000, max(1000, line_count // 10))
+        }
+        
+    except Exception as e:
+        raise HTTPException(500, f"Error reading metadata: {str(e)}")
+
+
+# Main content endpoint - optimized for full search
+@app.get("/api/logs/{session_id}/{file_path:path}")
+async def get_log_content(session_id: str, file_path: str):
+    """Get complete log file content for robust searching"""
+    
+    if session_id not in analysis_sessions:
+        raise HTTPException(404, "Session not found")
+    
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Extracted files not found")
+    
+    session_dir = extracted_files[session_id]
+    actual_path = session_dir / file_path
+    
+    if not actual_path.exists():
+        raise HTTPException(404, f"Log file not found: {file_path}")
+    
+    try:
+        file_size = actual_path.stat().st_size
+        
+        # Read ALL lines for complete search capability
+        lines = []
+        with open(actual_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                lines.append(line.rstrip())
+        
+        return {
+            "file": file_path,
+            "content": lines,  # Return ALL lines
+            "total_lines": len(lines),
+            "file_size": file_size,
+            "truncated": False,
+            "encoding": "utf-8"
+        }
+        
+    except MemoryError:
+        # If file is too large for memory, offer streaming alternative
+        raise HTTPException(413, "File too large for memory. Use streaming endpoint /api/logs/{session_id}/{file_path}/stream")
+    except Exception as e:
+        raise HTTPException(500, f"Error reading file: {str(e)}")
+
+
+# Streaming endpoint for very large files
+@app.get("/api/logs/{session_id}/{file_path:path}/stream")
+async def stream_log_content(
+    session_id: str, 
+    file_path: str,
+    start_line: int = Query(0, description="Starting line number"),
+    end_line: Optional[int] = Query(None, description="Ending line number"),
+    chunk_size: int = Query(10000, description="Lines per chunk")
+):
+    """Stream log content for very large files"""
+    
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Session not found")
+    
+    session_dir = extracted_files[session_id]
+    actual_path = session_dir / file_path
+    
+    if not actual_path.exists():
+        raise HTTPException(404, f"Log file not found: {file_path}")
+    
+    async def generate():
+        current_line = 0
+        chunk = []
+        
+        with open(actual_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if current_line >= start_line:
+                    if end_line and current_line >= end_line:
+                        break
+                    
+                    chunk.append(line.rstrip())
+                    
+                    if len(chunk) >= chunk_size:
+                        yield json.dumps({
+                            "lines": chunk,
+                            "start": current_line - len(chunk) + 1,
+                            "end": current_line
+                        }) + "\n"
+                        chunk = []
+                        await asyncio.sleep(0)  # Allow other tasks
+                
+                current_line += 1
+            
+            # Send remaining chunk
+            if chunk:
+                yield json.dumps({
+                    "lines": chunk,
+                    "start": current_line - len(chunk),
+                    "end": current_line - 1,
+                    "complete": True
+                }) + "\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+        headers={"X-Content-Type-Options": "nosniff"}
+    )
+
+
+# Server-side search endpoint for extremely large files
+@app.post("/api/logs/{session_id}/{file_path:path}/search")
+async def search_in_log(
+    session_id: str,
+    file_path: str,
+    query: Dict[str, Any],
+    max_results: int = Query(1000, description="Maximum results to return"),
+    context_lines: int = Query(0, description="Context lines around matches")
+):
+    """Server-side search for extremely large log files"""
+    
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Session not found")
+    
+    session_dir = extracted_files[session_id]
+    actual_path = session_dir / file_path
+    
+    if not actual_path.exists():
+        raise HTTPException(404, f"Log file not found: {file_path}")
+    
+    def evaluate_condition(condition: Dict, line: str, parsed_json: Optional[Dict] = None) -> bool:
+        """Evaluate a search condition"""
+        
+        cond_type = condition.get('type')
+        
+        if cond_type == 'TEXT':
+            return condition['value'].lower() in line.lower()
+        
+        elif cond_type == 'OR':
+            return any(evaluate_condition(c, line, parsed_json) for c in condition['conditions'])
+        
+        elif cond_type == 'AND':
+            return all(evaluate_condition(c, line, parsed_json) for c in condition['conditions'])
+        
+        elif cond_type == 'NOT':
+            return not evaluate_condition(condition['condition'], line, parsed_json)
+        
+        elif cond_type in ['FIELD_EQ', 'FIELD_NEQ', 'FIELD_GT', 'FIELD_GTE', 'FIELD_LT', 'FIELD_LTE']:
+            if parsed_json is None:
+                # Try to parse JSON
+                if line.strip().startswith('{'):
+                    try:
+                        parsed_json = json.loads(line)
+                    except:
+                        return False
+                else:
+                    return False
+            
+            field = condition['field']
+            value = condition['value']
+            field_value = parsed_json.get(field)
+            
+            if field_value is None:
+                return cond_type == 'FIELD_NEQ'
+            
+            if cond_type == 'FIELD_EQ':
+                return str(field_value).lower() == str(value).lower()
+            elif cond_type == 'FIELD_NEQ':
+                return str(field_value).lower() != str(value).lower()
+            elif cond_type == 'FIELD_GT':
+                return float(field_value) > float(value)
+            elif cond_type == 'FIELD_GTE':
+                return float(field_value) >= float(value)
+            elif cond_type == 'FIELD_LT':
+                return float(field_value) < float(value)
+            elif cond_type == 'FIELD_LTE':
+                return float(field_value) <= float(value)
+        
+        return True
+    
+    try:
+        results = []
+        total_lines = 0
+        matches_found = 0
+        
+        with open(actual_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line_num, line in enumerate(f):
+                total_lines += 1
+                line_stripped = line.rstrip()
+                
+                # Parse JSON if needed
+                parsed_json = None
+                if line_stripped.startswith('{'):
+                    try:
+                        parsed_json = json.loads(line_stripped)
+                    except:
+                        pass
+                
+                # Evaluate search condition
+                if evaluate_condition(query, line_stripped, parsed_json):
+                    matches_found += 1
+                    
+                    # Add context if requested
+                    result_entry = {
+                        "line_number": line_num + 1,
+                        "content": line_stripped
+                    }
+                    
+                    if context_lines > 0:
+                        # Add context (would need to buffer lines for this)
+                        result_entry["context"] = {
+                            "before": [],
+                            "after": []
+                        }
+                    
+                    results.append(result_entry)
+                    
+                    if len(results) >= max_results:
+                        break
+        
+        return {
+            "total_lines": total_lines,
+            "total_matches": matches_found,
+            "results": results,
+            "truncated": matches_found > len(results)
+        }
+        
+    except Exception as e:
+        raise HTTPException(500, f"Search error: {str(e)}")
+
+
+# Download endpoint remains the same but with better error handling
+@app.get("/api/logs/{session_id}/{file_path:path}/download")
+async def download_log(session_id: str, file_path: str):
+    """Download full log file"""
+    
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Session not found")
+    
+    session_dir = extracted_files[session_id]
+    actual_path = session_dir / file_path
+    
+    if not actual_path.exists():
+        raise HTTPException(404, "File not found")
+    
+    def iterfile():
+        with open(actual_path, 'rb') as f:
+            while chunk := f.read(1024 * 1024):  # 1MB chunks
+                yield chunk
+    
+    filename = Path(file_path).name
+    
+    return StreamingResponse(
+        iterfile(),
+        media_type="text/plain",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "text/plain; charset=utf-8"
+        }
+    )
+
+
+# Field extraction endpoint for better field discovery
+@app.get("/api/logs/{session_id}/{file_path:path}/fields")
+async def extract_log_fields(
+    session_id: str, 
+    file_path: str,
+    sample_size: int = Query(1000, description="Number of lines to sample")
+):
+    """Extract available fields from JSON log files"""
+    
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Session not found")
+    
+    session_dir = extracted_files[session_id]
+    actual_path = session_dir / file_path
+    
+    if not actual_path.exists():
+        raise HTTPException(404, f"Log file not found: {file_path}")
+    
+    try:
+        fields = {}
+        lines_sampled = 0
+        json_lines = 0
+        
+        with open(actual_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if lines_sampled >= sample_size:
+                    break
+                
+                lines_sampled += 1
+                line_stripped = line.strip()
+                
+                if line_stripped.startswith('{'):
+                    try:
+                        parsed = json.loads(line_stripped)
+                        json_lines += 1
+                        
+                        for key, value in parsed.items():
+                            if key not in fields:
+                                fields[key] = {
+                                    'type': type(value).__name__,
+                                    'count': 0,
+                                    'sample_values': set(),
+                                    'nullable': False
+                                }
+                            
+                            fields[key]['count'] += 1
+                            
+                            if value is None:
+                                fields[key]['nullable'] = True
+                            elif fields[key]['sample_values'] is not None:
+                                if len(fields[key]['sample_values']) < 50:
+                                    val_str = str(value)
+                                    if len(val_str) < 200:  # Don't store huge values
+                                        fields[key]['sample_values'].add(val_str)
+                                else:
+                                    fields[key]['sample_values'] = None  # Too many unique values
+                    except:
+                        pass
+        
+        # Convert sets to lists for JSON serialization
+        for field in fields.values():
+            if field['sample_values'] is not None:
+                field['sample_values'] = list(field['sample_values'])[:20]
+        
+        return {
+            "fields": fields,
+            "lines_sampled": lines_sampled,
+            "json_lines": json_lines,
+            "is_json_file": json_lines > lines_sampled * 0.1
+        }
+        
+    except Exception as e:
+        raise HTTPException(500, f"Error extracting fields: {str(e)}")
+
 
 def ensure_localhost_only():
     """Refuse to start if not on localhost"""
