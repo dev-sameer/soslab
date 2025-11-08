@@ -36,6 +36,10 @@ import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import multiprocessing as mp
+import pickle
+import aiofiles
+import uuid
+from asyncio import create_task, Queue
 
 try:
     from fast_stats_service import FastStatsService
@@ -107,6 +111,19 @@ active_analyses = {}
 # Legacy thread pool for other operations
 thread_pool = ThreadPoolExecutor(max_workers=min(8, mp.cpu_count()))
 
+# Create a process pool for heavy analysis work
+process_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT_ANALYSES)
+
+# Add persistent state storage
+ANALYSIS_STATE_DIR = Path("data/analysis_state")
+ANALYSIS_STATE_DIR.mkdir(exist_ok=True, parents=True)
+
+# WebSocket connections for real-time updates
+websocket_connections: Dict[str, Set[WebSocket]] = defaultdict(set)
+
+# Progress queue for real-time updates
+progress_queues: Dict[str, Queue] = {}
+
 print(f"""
 🖥️  System Configuration:
    CPU Cores: {CPU_COUNT}
@@ -135,6 +152,34 @@ app.add_middleware(
 analysis_sessions = {}
 extracted_files = {}
 auto_analysis_sessions = {}  # Store auto-analysis results separately
+
+# Analysis state manager
+class AnalysisStateManager:
+    """Manages persistent state for analyses"""
+    
+    @staticmethod
+    async def save_state(session_id: str, state: dict):
+        """Save analysis state to disk"""
+        state_file = ANALYSIS_STATE_DIR / f"{session_id}.json"
+        async with aiofiles.open(state_file, 'w') as f:
+            await f.write(json.dumps(state, default=str))
+    
+    @staticmethod
+    async def load_state(session_id: str) -> Optional[dict]:
+        """Load analysis state from disk"""
+        state_file = ANALYSIS_STATE_DIR / f"{session_id}.json"
+        if state_file.exists():
+            async with aiofiles.open(state_file, 'r') as f:
+                content = await f.read()
+                return json.loads(content)
+        return None
+    
+    @staticmethod
+    async def delete_state(session_id: str):
+        """Delete analysis state from disk"""
+        state_file = ANALYSIS_STATE_DIR / f"{session_id}.json"
+        if state_file.exists():
+            state_file.unlink()
 
 
 
@@ -3223,65 +3268,261 @@ async def delete_specific_session(session_id: str):
     except Exception as e:
         raise HTTPException(500, f"Failed to delete session: {str(e)}")
 
+# Helper functions for improved auto-analysis
+def run_analysis_in_process(file_path: str, session_id: str, progress_queue_id: str):
+    """Run analysis in a separate process - completely isolated"""
+    import asyncio
+    import multiprocessing as mp
+    
+    # Create a new event loop for this process
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # This runs in a separate process - won't block main app
+    try:
+        # Import here to avoid serialization issues
+        from autogrep import AutoGrep
+        
+        analyzer = AutoGrep(workers=min(mp.cpu_count(), 8))
+        
+        # Create a progress callback
+        def progress_callback(progress_data):
+            # Send progress updates via pickle file
+            try:
+                with open(f"/tmp/progress_{progress_queue_id}.pkl", 'wb') as f:
+                    pickle.dump(progress_data, f)
+            except:
+                pass
+        
+        # Run the analysis
+        result = loop.run_until_complete(
+            analyzer.analyze_tar_streaming(file_path, callback=progress_callback)
+        )
+        
+        return result
+        
+    finally:
+        loop.close()
+
+
+async def notify_websockets(session_id: str, state: dict):
+    """Notify all WebSocket clients about state changes"""
+    if session_id in websocket_connections:
+        disconnected = set()
+        for ws in websocket_connections[session_id]:
+            try:
+                await ws.send_json(state)
+            except:
+                disconnected.add(ws)
+        
+        # Remove disconnected clients
+        websocket_connections[session_id] -= disconnected
+
+
+async def run_auto_analysis_task_improved(session_id: str):
+    """Improved non-blocking analysis task"""
+    try:
+        # Generate unique ID for this analysis
+        analysis_id = str(uuid.uuid4())
+        
+        # Initial state
+        state = {
+            'session_id': session_id,
+            'analysis_id': analysis_id,
+            'status': 'processing',
+            'started_at': datetime.now().isoformat(),
+            'progress': 0,
+            'message': 'Initializing analysis...',
+            'current_file': None,
+            'files_processed': 0,
+            'errors_found': 0
+        }
+        
+        # Save initial state
+        await AnalysisStateManager.save_state(session_id, state)
+        auto_analysis_sessions[session_id] = state
+        
+        # Find the file
+        upload_path = Path("data/uploads")
+        original_file = None
+        for file in upload_path.iterdir():
+            if session_id in file.name and file.is_file():
+                original_file = file
+                break
+        
+        if not original_file:
+            raise Exception(f"Original file not found for session {session_id}")
+        
+        # Create progress monitoring task
+        progress_queue_id = analysis_id
+        
+        async def monitor_progress():
+            """Monitor progress from the subprocess"""
+            last_update = time.time()
+            while state['status'] == 'processing':
+                try:
+                    # Check for progress updates from subprocess
+                    progress_file = f"/tmp/progress_{progress_queue_id}.pkl"
+                    if os.path.exists(progress_file):
+                        with open(progress_file, 'rb') as f:
+                            progress_data = pickle.load(f)
+                        
+                        # Update state with progress
+                        state.update(progress_data)
+                        state['last_update'] = time.time()
+                        
+                        # Save state
+                        await AnalysisStateManager.save_state(session_id, state)
+                        
+                        # Notify WebSocket clients
+                        await notify_websockets(session_id, state)
+                        
+                        os.remove(progress_file)
+                    
+                    await asyncio.sleep(0.1)  # Check every 100ms
+                    
+                except Exception as e:
+                    print(f"Progress monitoring error: {e}")
+                    await asyncio.sleep(0.5)
+        
+        # Start progress monitoring
+        monitor_task = create_task(monitor_progress())
+        
+        # Run analysis in separate process - THIS WON'T BLOCK
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            process_pool,
+            run_analysis_in_process,
+            str(original_file),
+            session_id,
+            progress_queue_id
+        )
+        
+        # Analysis completed
+        monitor_task.cancel()
+        
+        # Process results (convert to the format expected by frontend)
+        all_problems = []
+        problem_rank = 1
+        
+        for group in result.get('error_groups', []):
+            all_problems.append({
+                "rank": problem_rank,
+                "component": group['component'],
+                "pattern": group.get('pattern', '')[:200],
+                "pattern_id": group['pattern_id'],
+                "severity": group['severity'],
+                "description": group.get('message', ''),
+                "count": group['count'],
+                "files": group['files'][:10],
+                "message": group['message'],
+                "samples": group['samples'],
+                "sample_line": group['samples'][0]['full_line'] if group['samples'] else '',
+                "sample_file": group['files'][0] if group['files'] else 'unknown',
+                "signature": group['signature'],
+                "full_context": group['samples'][0].get('full_context', '') if group['samples'] else '',
+                "context_before": group['samples'][0].get('context_before', []) if group['samples'] else [],
+                "context_after": group['samples'][0].get('context_after', []) if group['samples'] else [],
+                "has_correlation": group['has_correlation'],
+                "has_stack_trace": group['has_stack_trace'],
+                "correlation_id": group['samples'][0].get('correlation_id') if group['samples'] else None,
+                "request_id": group['samples'][0].get('request_id') if group['samples'] else None,
+                "error_code": group['samples'][0].get('error_code') if group['samples'] else None,
+                "stack_trace": group['samples'][0].get('stack_trace') if group['samples'] else None,
+                "json_fields": group['samples'][0].get('json_fields', {}) if group['samples'] else {},
+                "is_monitoring": False
+            })
+            problem_rank += 1
+        
+        monitoring_problems = [p for p in all_problems if 'monitoring' in p['component'].lower()]
+        summary = result.get('summary', {})
+        component_stats = result.get('errors_by_component', {})
+        severity_breakdown = result.get('errors_by_severity', {})
+        
+        results_data = {
+            "analysis_duration": summary.get('end_time', 0) - summary.get('start_time', 0) if summary else 0,
+            "total_problems": result.get('total_errors', 0),
+            "gitlab_problems": len(all_problems) - len(monitoring_problems),
+            "monitoring_issues": len(monitoring_problems),
+            "unique_patterns": len(all_problems),
+            "problems": all_problems,
+            "monitoring_problems": monitoring_problems,
+            "component_stats": component_stats,
+            "severity_breakdown": severity_breakdown,
+            "summary": summary,
+            "metadata": {
+                "files_processed": summary.get('files_processed', 0),
+                "lines_processed": summary.get('lines_processed', 0),
+                "analysis_duration_seconds": summary.get('end_time', 0) - summary.get('start_time', 0) if summary else 0,
+                "pattern_bank_size": 0,
+                "turbo_mode": True
+            }
+        }
+        
+        # Final state
+        final_state = {
+            'session_id': session_id,
+            'analysis_id': analysis_id,
+            'status': 'completed',
+            'completed_at': datetime.now().isoformat(),
+            'results': results_data,
+            'progress': 100,
+            'message': 'Analysis completed!'
+        }
+        
+        # Save final state
+        await AnalysisStateManager.save_state(session_id, final_state)
+        auto_analysis_sessions[session_id] = final_state
+        
+        # Notify completion
+        await notify_websockets(session_id, final_state)
+        
+    except Exception as e:
+        print(f"Analysis failed: {e}")
+        import traceback
+        traceback.print_exc()
+        error_state = {
+            'session_id': session_id,
+            'status': 'failed',
+            'error': str(e),
+            'progress': 0
+        }
+        await AnalysisStateManager.save_state(session_id, error_state)
+        auto_analysis_sessions[session_id] = error_state
+        await notify_websockets(session_id, error_state)
+
+
 # Auto-Analysis endpoints (OPTIMIZED)
 @app.post("/api/auto-analysis/{session_id}")
 async def start_auto_analysis(session_id: str, background_tasks: BackgroundTasks):
-    """Start auto-analysis with proper locking"""
+    """Start auto-analysis with improved state management"""
     
     if session_id not in extracted_files:
         raise HTTPException(404, "Session not found")
     
-    # Check if already running
-    if session_id in auto_analysis_sessions:
-        current_status = auto_analysis_sessions[session_id].get('status')
-        if current_status == 'processing':
-            return {
-                'session_id': session_id,
-                'status': 'already_running',
-                'message': 'Analysis already in progress',
-                'current_state': auto_analysis_sessions[session_id]
-            }
-        elif current_status == 'completed':
-            # Return existing results
-            return {
-                'session_id': session_id,
-                'status': 'already_completed',
-                'results': auto_analysis_sessions[session_id].get('results'),
-                'message': 'Analysis already completed'
-            }
+    # Check for existing state (including from previous runs)
+    existing_state = await AnalysisStateManager.load_state(session_id)
     
-    # Check if locked (being processed)
-    if session_id in analysis_locks and analysis_locks[session_id]:
-        return {
-            'session_id': session_id,
-            'status': 'already_running',
-            'message': 'Analysis already in progress'
-        }
+    if existing_state:
+        if existing_state.get('status') == 'processing':
+            # Check if it's actually still running
+            if existing_state.get('last_update'):
+                if time.time() - existing_state['last_update'] < 30:  # Updated in last 30s
+                    return existing_state
+            
+            # Stale processing state - restart
+            await AnalysisStateManager.delete_state(session_id)
+        
+        elif existing_state.get('status') == 'completed':
+            return existing_state
     
-    # Lock this session
-    analysis_locks[session_id] = True
-    
-    # Initialize session with ALL required fields for persistence
-    auto_analysis_sessions[session_id] = {
-        'session_id': session_id,
-        'status': 'processing',
-        'started_at': datetime.now().isoformat(),
-        'started_at_timestamp': time.time(),  # Required for duration calculation
-        'progress': 0,
-        'message': 'Initializing analysis...'
-    }
-    
-    # Start background analysis
-    background_tasks.add_task(run_auto_analysis_task, session_id)
-    
-    # Release lock after task is queued
-    analysis_locks[session_id] = False
+    # Start new analysis in background
+    create_task(run_auto_analysis_task_improved(session_id))
     
     return {
         'session_id': session_id,
         'status': 'started',
-        'message': 'Analysis started',
-        'current_state': auto_analysis_sessions[session_id]  # Return current state so frontend can use it
+        'message': 'Analysis started in background'
     }
 
 # OPTIMIZED run_auto_analysis_task function
@@ -3512,16 +3753,23 @@ async def run_auto_analysis_task(session_id: str):
 
 @app.get("/api/auto-analysis/{session_id}")
 async def get_auto_analysis_status(session_id: str):
-    """Get auto-analysis status and results"""
+    """Get analysis status from persistent storage"""
     
-    if session_id not in auto_analysis_sessions:
-        return {
-            "session_id": session_id,
-            "status": "not_started",
-            "message": "Auto-analysis not started"
-        }
+    # Try memory first
+    if session_id in auto_analysis_sessions:
+        return auto_analysis_sessions[session_id]
     
-    return auto_analysis_sessions[session_id]
+    # Try persistent storage
+    state = await AnalysisStateManager.load_state(session_id)
+    if state:
+        auto_analysis_sessions[session_id] = state  # Cache it
+        return state
+    
+    return {
+        "session_id": session_id,
+        "status": "not_started",
+        "message": "Auto-analysis not started"
+    }
 
 @app.delete("/api/auto-analysis/{session_id}")
 async def clear_auto_analysis(session_id: str):
@@ -4240,79 +4488,30 @@ def process_turbo_results(report: Dict, all_results: List[Dict]) -> Dict:
     return processed
 
 
-# Update the endpoint to use turbo mode
-@app.post("/api/auto-analysis/{session_id}")
-async def start_auto_analysis(session_id: str, background_tasks: BackgroundTasks):
-    """Start TURBO auto-analysis"""
-    
-    if session_id not in extracted_files:
-        raise HTTPException(404, "Session not found")
-    
-    # Check status
-    if session_id in auto_analysis_sessions:
-        current_status = auto_analysis_sessions[session_id].get('status')
-        if current_status == 'processing':
-            return {
-                'session_id': session_id,
-                'status': 'already_running',
-                'message': 'Analysis already in progress'
-            }
-    
-    # Initialize session
-    auto_analysis_sessions[session_id] = {
-        'session_id': session_id,
-        'status': 'processing',
-        'started_at': datetime.now().isoformat(),
-        'progress': 0,
-        'message': 'Initializing TURBO analysis...'
-    }
-    
-    # Start TURBO analysis
-    background_tasks.add_task(run_turbo_auto_analysis, session_id)
-    
-    return {
-        'session_id': session_id,
-        'status': 'started',
-        'message': 'TURBO analysis started',
-        'mode': 'turbo'
-    }
-
-
-# Add WebSocket endpoint for real-time streaming
+# Add WebSocket endpoint for real-time updates
 @app.websocket("/ws/auto-analysis/{session_id}")
-async def auto_analysis_stream(websocket: WebSocket, session_id: str):
-    """Stream auto-analysis results in real-time"""
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket for real-time analysis updates"""
     await websocket.accept()
+    websocket_connections[session_id].add(websocket)
     
     try:
+        # Send current state immediately
+        state = await AnalysisStateManager.load_state(session_id)
+        if state:
+            await websocket.send_json(state)
+        elif session_id in auto_analysis_sessions:
+            await websocket.send_json(auto_analysis_sessions[session_id])
+        
+        # Keep connection alive
         while True:
-            if session_id in auto_analysis_sessions:
-                data = auto_analysis_sessions[session_id]
-                
-                # Send current state
-                await websocket.send_json({
-                    'type': 'update',
-                    'status': data.get('status'),
-                    'progress': data.get('progress', 0),
-                    'message': data.get('message', ''),
-                    'live_error_count': data.get('live_error_count', 0),
-                    'partial_results': data.get('partial_results', [])
-                })
-                
-                # If completed, send final results
-                if data.get('status') == 'completed':
-                    await websocket.send_json({
-                        'type': 'complete',
-                        'results': data.get('results')
-                    })
-                    break
-                    
-            await asyncio.sleep(0.5)  # Update every 500ms
+            await asyncio.sleep(30)  # Ping every 30s
+            await websocket.send_json({"type": "ping"})
             
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
-        await websocket.close()
+        websocket_connections[session_id].discard(websocket)
 
 
 if __name__ == "__main__":

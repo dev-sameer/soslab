@@ -13,7 +13,8 @@ const AutoAnalysis = ({ sessionId }) => {
     const [isRunning, setIsRunning] = useState(false);
     const [expandedProblems, setExpandedProblems] = useState({});
     const [copiedIndex, setCopiedIndex] = useState(null);
-    const pollIntervalRef = useRef(null);
+    const wsRef = useRef(null);
+    const reconnectTimeoutRef = useRef(null);
 
     const [filters, setFilters] = useState({
         severity: 'all',
@@ -25,43 +26,46 @@ const AutoAnalysis = ({ sessionId }) => {
     const [viewMode, setViewMode] = useState('errors');
     const [errorLimit, setErrorLimit] = useState(25);
 
-    // Enhanced Polling with detailed progress tracking - useCallback to prevent recreating
-    const startPolling = useCallback(() => {
-        // Clear any existing interval first
-        if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current);
-            pollIntervalRef.current = null;
-        }
+    // WebSocket connection for real-time updates
+    const connectWebSocket = useCallback(() => {
+        if (!sessionId || wsRef.current?.readyState === WebSocket.OPEN) return;
 
-        console.log('Starting polling for session:', sessionId);
+        const ws = new WebSocket(`ws://localhost:8000/ws/auto-analysis/${sessionId}`);
         
-        // Set up new polling interval
-        pollIntervalRef.current = setInterval(async () => {
-            try {
-                const response = await fetch(`/api/auto-analysis/${sessionId}`);
-                const data = await response.json();
-                
-                console.log('Poll data:', data.status, data.progress);
-                
-                // Update state with fresh data
-                setAnalysisState(data);
-                
-                // Update running state based on status
-                if (data.status === 'processing') {
-                    setIsRunning(true);
-                } else if (data.status === 'completed' || data.status === 'failed') {
-                    setIsRunning(false);
-                    clearInterval(pollIntervalRef.current);
-                    pollIntervalRef.current = null;
-                    console.log('Analysis finished, stopping polling');
-                }
-            } catch (error) {
-                console.error('Error polling:', error);
-            }
-        }, 500); // Poll every 500ms for smoother updates
+        ws.onopen = () => {
+            console.log('WebSocket connected for session:', sessionId);
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            
+            if (data.type === 'ping') return; // Ignore pings
+            
+            // Update state with real-time data
+            setAnalysisState(data);
+            setIsRunning(data.status === 'processing');
+            
+            console.log('Real-time update:', data.progress, data.message);
+        };
+
+        ws.onerror = (error) => {
+            console.error('WebSocket error:', error);
+        };
+
+        ws.onclose = () => {
+            console.log('WebSocket closed, reconnecting...');
+            wsRef.current = null;
+            
+            // Reconnect after 2 seconds
+            reconnectTimeoutRef.current = setTimeout(() => {
+                connectWebSocket();
+            }, 2000);
+        };
+
+        wsRef.current = ws;
     }, [sessionId]);
 
-    // Check status whenever component mounts or sessionId changes
+    // Initial load and WebSocket setup
     useEffect(() => {
         if (!sessionId) {
             setAnalysisState(null);
@@ -69,85 +73,50 @@ const AutoAnalysis = ({ sessionId }) => {
             return;
         }
 
-        console.log('AutoAnalysis mounted/updated for session:', sessionId);
-
-        const checkCurrentStatus = async () => {
+        // Load current state immediately
+        const loadState = async () => {
             try {
                 const response = await fetch(`/api/auto-analysis/${sessionId}`);
                 const data = await response.json();
                 
-                console.log('Current status check:', data.status);
-                
-                // Update state based on current backend status
                 setAnalysisState(data);
+                setIsRunning(data.status === 'processing');
                 
-                if (data.status === 'processing') {
-                    // Analysis is running - restart polling to track it
-                    setIsRunning(true);
-                    startPolling();
-                } else if (data.status === 'completed') {
-                    // Analysis completed
-                    setIsRunning(false);
-                } else if (data.status === 'failed') {
-                    // Analysis failed
-                    setIsRunning(false);
-                } else {
-                    // Not started or unknown status
-                    setAnalysisState(null);
-                    setIsRunning(false);
-                }
+                // Connect WebSocket for updates
+                connectWebSocket();
             } catch (error) {
-                console.error('Error checking auto-analysis status:', error);
-                // On error, assume not running
-                setIsRunning(false);
+                console.error('Error loading state:', error);
             }
         };
 
-        // Always check current status when mounting
-        checkCurrentStatus();
+        loadState();
 
-        // Cleanup function - stop polling when unmounting
+        // Cleanup
         return () => {
-            console.log('AutoAnalysis unmounting, clearing polling');
-            if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
+            if (wsRef.current) {
+                wsRef.current.close();
+                wsRef.current = null;
+            }
+            if (reconnectTimeoutRef.current) {
+                clearTimeout(reconnectTimeoutRef.current);
             }
         };
-    }, [sessionId, startPolling]);
+    }, [sessionId, connectWebSocket]);
 
     const startAnalysis = async () => {
         try {
-            console.log('Starting analysis for session:', sessionId);
             setIsRunning(true);
             
-            const response = await fetch(`/api/auto-analysis/${sessionId}`, { method: 'POST' });
+            const response = await fetch(`/api/auto-analysis/${sessionId}`, { 
+                method: 'POST' 
+            });
             const data = await response.json();
             
-            console.log('Start analysis response:', data);
-
-            if (data.status === 'already_completed') {
-                // Analysis was already done
-                setAnalysisState(data.results || data);
-                setIsRunning(false);
-            } else if (data.status === 'already_running') {
-                // Analysis already running - get current state and poll
-                const statusResponse = await fetch(`/api/auto-analysis/${sessionId}`);
-                const statusData = await statusResponse.json();
-                setAnalysisState(statusData);
-                setIsRunning(true);
-                startPolling();
-            } else {
-                // New analysis started
-                setAnalysisState({ 
-                    status: 'processing', 
-                    progress: 0, 
-                    message: 'Initializing analysis...',
-                    started_at: new Date().toISOString()
-                });
-                setIsRunning(true);
-                startPolling();
-            }
+            setAnalysisState(data);
+            
+            // WebSocket will handle real-time updates
+            connectWebSocket();
+            
         } catch (error) {
             console.error('Error starting analysis:', error);
             setIsRunning(false);
@@ -156,10 +125,10 @@ const AutoAnalysis = ({ sessionId }) => {
 
     const clearAnalysis = async () => {
         try {
-            // Stop any polling first
-            if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
+            // Close WebSocket connection
+            if (wsRef.current) {
+                wsRef.current.close();
+                wsRef.current = null;
             }
             
             await fetch(`/api/auto-analysis/${sessionId}`, { method: 'DELETE' });
