@@ -71,10 +71,30 @@ except ImportError as e:
         return UnixMCPServer(base_dir=base_dir)
     import threading
 
+# Import GitLab Duo analyzer with proper error handling
+try:
+    from gitlab_duo_analyzer import GitLabDuoRESTAnalyzer
+    DUO_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  GitLab Duo analyzer not available: {e}")
+    DUO_AVAILABLE = False
+    GitLabDuoRESTAnalyzer = None
+
 
 # Initialize components
 power_search = PowerSearchEngine()
 duo_chat = GitLabDuoChatIntegration()
+
+# Initialize REST analyzer
+duo_rest_analyzer = GitLabDuoRESTAnalyzer() if GitLabDuoRESTAnalyzer else None
+
+# Debug: Check if analyzer is properly initialized
+if duo_rest_analyzer:
+    print(f"✅ GitLab Duo REST Analyzer initialized")
+    print(f"   URL: {duo_rest_analyzer.gitlab_url}")
+    print(f"   Enabled: {duo_rest_analyzer.enabled}")
+else:
+    print("❌ GitLab Duo REST Analyzer is None")
 
 # ============== WORKER CONFIGURATION ==============
 
@@ -3789,6 +3809,451 @@ async def clear_auto_analysis(session_id: str):
         "message": "No auto-analysis results found"
     }
 
+@app.post("/api/auto-analysis/{session_id}/duo-feed")
+async def feed_to_duo(session_id: str, background_tasks: BackgroundTasks):
+    """Feed auto-analysis results to GitLab Duo"""
+    
+    # Check if Duo analyzer is available
+    if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
+        raise HTTPException(500, "Duo analyzer not available")
+    
+    # Check prerequisites
+    if session_id not in auto_analysis_sessions:
+        raise HTTPException(404, "No analysis found")
+    
+    if auto_analysis_sessions[session_id].get('status') != 'completed':
+        raise HTTPException(400, "Auto-analysis must complete first")
+    
+    if not os.getenv('GITLAB_TOKEN'):
+        raise HTTPException(400, "GITLAB_TOKEN not configured. Set it with: export GITLAB_TOKEN=your_token")
+    
+    # Check if Duo analysis already running/complete
+    existing = duo_rest_analyzer.get_session_status(session_id)
+    if existing:
+        if existing['status'] == 'processing':
+            return existing
+        elif existing['status'] == 'completed':
+            return existing  # Return cached results
+    
+    # Start Duo analysis in background
+    background_tasks.add_task(
+        run_duo_analysis,
+        session_id,
+        auto_analysis_sessions[session_id]['results']
+    )
+    
+    return {
+        'status': 'started',
+        'message': 'Duo analysis started',
+        'session_id': session_id
+    }
+
+async def run_duo_analysis(session_id: str, analysis_results: Dict):
+    """Background task for Duo analysis"""
+    try:
+        # Get error groups from results - check both 'error_groups' and 'problems'
+        error_groups = analysis_results.get('error_groups', [])
+        if not error_groups:
+            # Fall back to 'problems' if 'error_groups' not found
+            error_groups = analysis_results.get('problems', [])
+        
+        if not error_groups:
+            raise Exception("No error groups found in analysis results")
+        
+        print(f"🤖 Starting GitLab Duo analysis for {len(error_groups)} error patterns...")
+        
+        # Feed to Duo
+        result = await duo_rest_analyzer.analyze_errors_with_batching(session_id, error_groups)
+        
+        # Store in session
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_analysis'] = result
+        
+        print(f"✅ GitLab Duo analysis completed for session: {session_id}")
+        
+    except Exception as e:
+        print(f"❌ Duo analysis failed: {e}")
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_analysis'] = {
+                'status': 'failed',
+                'error': str(e)
+            }
+
+@app.get("/api/auto-analysis/{session_id}/duo-status")
+async def get_duo_status(session_id: str):
+    """Get Duo analysis status - DEPRECATED, redirects to duo-rest-status"""
+    
+    # Just redirect to the REST version
+    return await get_duo_rest_status(session_id)
+
+@app.delete("/api/auto-analysis/{session_id}/duo-clear")
+async def clear_duo_analysis(session_id: str):
+    """Clear Duo analysis for a session"""
+    
+    if DUO_AVAILABLE and duo_analyzer:
+        # Clear from duo_analyzer
+        if session_id in duo_rest_analyzer.active_conversations:
+            del duo_rest_analyzer.active_conversations[session_id]
+        
+        # Delete from disk
+        file_path = Path(f"data/duo_analysis/{session_id}.json")
+        if file_path.exists():
+            file_path.unlink()
+    
+    # Clear from auto_analysis_sessions
+    if session_id in auto_analysis_sessions:
+        if 'duo_analysis' in auto_analysis_sessions[session_id]:
+            del auto_analysis_sessions[session_id]['duo_analysis']
+    
+    return {'status': 'cleared', 'message': 'Duo analysis cleared'}
+
+
+@app.post("/api/auto-analysis/{session_id}/duo-feed-chunked")
+async def feed_to_duo_chunked(session_id: str, background_tasks: BackgroundTasks):
+    """Feed auto-analysis results to GitLab Duo using chunked approach"""
+    
+    # Check if Duo analyzer is available
+    if not duo_rest_analyzer.enabled:
+        raise HTTPException(500, "Duo analyzer not configured")
+    
+    # Check prerequisites
+    if session_id not in auto_analysis_sessions:
+        raise HTTPException(404, "No analysis found")
+    
+    if auto_analysis_sessions[session_id].get('status') != 'completed':
+        raise HTTPException(400, "Auto-analysis must complete first")
+    
+    if not os.getenv('GITLAB_TOKEN'):
+        raise HTTPException(400, "GITLAB_TOKEN not configured. Set it with: export GITLAB_TOKEN=**********")
+    
+    # Check if Duo analysis already running/complete
+    existing = duo_rest_analyzer.get_session_status(session_id)
+    if existing:
+        if existing['status'] == 'processing':
+            return existing
+        elif existing['status'] == 'completed':
+            return existing  # Return cached results
+    
+    # Start chunked Duo analysis in background
+    background_tasks.add_task(
+        run_chunked_duo_analysis,
+        session_id,
+        auto_analysis_sessions[session_id]['results']
+    )
+    
+    return {
+        'status': 'started',
+        'message': 'Chunked Duo analysis started',
+        'session_id': session_id
+    }
+
+
+@app.get("/api/auto-analysis/{session_id}/duo-status-enhanced")
+async def get_duo_status_enhanced(session_id: str):
+    """Get enhanced Duo analysis status with chunk progress"""
+    
+    if not duo_rest_analyzer.enabled:
+        return {'status': 'not_available', 'error': 'Duo analyzer not configured'}
+    
+    # Check from enhanced analyzer
+    status = duo_rest_analyzer.get_session_status(session_id)
+    
+    if status:
+        return status
+    
+    # Also check if stored in auto_analysis_sessions
+    if session_id in auto_analysis_sessions:
+        duo_data = auto_analysis_sessions[session_id].get('duo_analysis')
+        if duo_data:
+            return duo_data
+    
+    return {'status': 'not_started'}
+
+
+@app.delete("/api/auto-analysis/{session_id}/duo-clear-enhanced")
+async def clear_duo_analysis_enhanced(session_id: str):
+    """Clear Duo analysis for a session - enhanced version"""
+    
+    # Clear from enhanced analyzer
+    cleared = duo_rest_analyzer.clear_session(session_id)
+    
+    # Clear from auto_analysis_sessions
+    if session_id in auto_analysis_sessions:
+        if 'duo_analysis' in auto_analysis_sessions[session_id]:
+            del auto_analysis_sessions[session_id]['duo_analysis']
+    
+    return {
+        'status': 'cleared' if cleared else 'not_found',
+        'message': 'Duo analysis cleared' if cleared else 'No analysis found to clear'
+    }
+
+
+@app.websocket("/ws/duo-analysis/{session_id}")
+async def websocket_duo_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket for real-time Duo analysis updates"""
+    await websocket.accept()
+    
+    try:
+        # Send updates while processing
+        while True:
+            # Get current status
+            status = duo_rest_analyzer.get_session_status(session_id)
+            
+            if status:
+                await websocket.send_json(status)
+                
+                # Stop if completed or failed
+                if status['status'] in ['completed', 'failed']:
+                    break
+            
+            await asyncio.sleep(1)  # Update every second
+            
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        await websocket.close()
+
+
+@app.post("/api/auto-analysis/{session_id}/duo-rest-analyze")
+async def start_duo_rest_analysis(session_id: str, background_tasks: BackgroundTasks):
+    """Start Duo analysis using REST API with batching"""
+    
+    # Validate prerequisites
+    if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
+        raise HTTPException(500, "GitLab Duo not configured. Set GITLAB_TOKEN environment variable.")
+    
+    if session_id not in auto_analysis_sessions:
+        raise HTTPException(404, "Auto-analysis not found. Run auto-analysis first.")
+    
+    if auto_analysis_sessions[session_id].get('status') != 'completed':
+        raise HTTPException(400, "Auto-analysis must complete first")
+    
+    # Check for existing analysis
+    existing = duo_rest_analyzer.get_session_status(session_id)
+    if existing:
+        if existing['status'] == 'processing':
+            return existing
+        elif existing['status'] == 'completed':
+            return existing
+    
+    # Start analysis in background
+    background_tasks.add_task(
+        run_duo_rest_analysis,
+        session_id,
+        auto_analysis_sessions[session_id]['results']
+    )
+    
+    return {
+        'status': 'started',
+        'message': 'Duo REST API analysis started',
+        'session_id': session_id
+    }
+
+
+async def run_duo_rest_analysis(session_id: str, analysis_results: Dict):
+    """Background task for REST API Duo analysis"""
+    try:
+        # Extract error groups
+        error_groups = analysis_results.get('problems', [])
+        if not error_groups:
+            error_groups = analysis_results.get('error_groups', [])
+        
+        if not error_groups:
+            raise Exception("No error patterns found in analysis results")
+        
+        print(f"🤖 Starting GitLab Duo REST API analysis for {len(error_groups)} patterns...")
+        
+        # Run analysis with batching
+        result = await duo_rest_analyzer.analyze_errors_with_batching(session_id, error_groups)
+        
+        # Store result in session
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_rest_analysis'] = result
+        
+        print(f"✅ Duo REST analysis completed for session: {session_id}")
+        
+    except Exception as e:
+        print(f"❌ Duo REST analysis failed: {e}")
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_rest_analysis'] = {
+                'status': 'failed',
+                'error': str(e),
+                'current_message': f'Analysis failed: {str(e)}'
+            }
+
+
+@app.get("/api/auto-analysis/{session_id}/duo-rest-status")
+async def get_duo_rest_status(session_id: str):
+    """Get Duo REST analysis status"""
+    
+    if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
+        return {
+            'status': 'not_available',
+            'error': 'GitLab Duo not configured'
+        }
+    
+    # Check analyzer storage
+    status = duo_rest_analyzer.get_session_status(session_id)
+    if status:
+        return status
+    
+    # Check session memory
+    if session_id in auto_analysis_sessions:
+        duo_data = auto_analysis_sessions[session_id].get('duo_rest_analysis')
+        if duo_data:
+            return duo_data
+    
+    return {'status': 'not_started'}
+
+
+@app.delete("/api/auto-analysis/{session_id}/duo-rest-clear")
+async def clear_duo_rest_analysis(session_id: str):
+    """Clear Duo REST analysis"""
+    
+    if not duo_rest_analyzer:
+        return {'status': 'not_available'}
+    
+    # Clear from analyzer
+    cleared = duo_rest_analyzer.clear_session(session_id)
+    
+    # Clear from session memory
+    if session_id in auto_analysis_sessions:
+        if 'duo_rest_analysis' in auto_analysis_sessions[session_id]:
+            del auto_analysis_sessions[session_id]['duo_rest_analysis']
+    
+    return {
+        'status': 'cleared' if cleared else 'not_found',
+        'message': 'Duo analysis cleared successfully' if cleared else 'No analysis found'
+    }
+
+
+@app.get("/api/duo/test-connection")
+async def test_duo_connection():
+    """Test GitLab Duo API connection"""
+    
+    if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
+        return {
+            'connected': False,
+            'error': 'GITLAB_TOKEN not configured'
+        }
+    
+    try:
+        connected = await duo_rest_analyzer.test_connection()
+        return {
+            'connected': connected,
+            'gitlab_url': duo_rest_analyzer.gitlab_url,
+            'message': 'Connection successful' if connected else 'Connection failed'
+        }
+    except Exception as e:
+        return {
+            'connected': False,
+            'error': str(e)
+        }
+
+
+@app.post("/api/duo/configure-batching")
+async def configure_batching(config: Dict):
+    """Configure Duo batching parameters"""
+    
+    if not duo_rest_analyzer:
+        raise HTTPException(500, "Duo REST analyzer not available")
+    
+    if 'errors_per_batch' in config:
+        duo_rest_analyzer.errors_per_batch = max(1, min(50, config['errors_per_batch']))
+    
+    if 'timeout_seconds' in config:
+        duo_rest_analyzer.timeout_seconds = max(10, min(120, config['timeout_seconds']))
+    
+    if 'max_retries' in config:
+        duo_rest_analyzer.max_retries = max(1, min(5, config['max_retries']))
+    
+    return {
+        'errors_per_batch': duo_rest_analyzer.errors_per_batch,
+        'timeout_seconds': duo_rest_analyzer.timeout_seconds,
+        'max_retries': duo_rest_analyzer.max_retries
+    }
+
+
+# WebSocket for real-time updates
+@app.websocket("/ws/duo-rest/{session_id}")
+async def websocket_duo_rest(websocket: WebSocket, session_id: str):
+    """WebSocket for real-time Duo REST analysis updates"""
+    await websocket.accept()
+    
+    try:
+        while True:
+            # Get current status
+            if duo_rest_analyzer:
+                status = duo_rest_analyzer.get_session_status(session_id)
+                
+                if status:
+                    await websocket.send_json(status)
+                    
+                    # Exit if complete
+                    if status['status'] in ['completed', 'failed', 'partial']:
+                        break
+            
+            await asyncio.sleep(1)  # Update every second
+            
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        await websocket.close()
+
+
+@app.post("/api/duo/configure")
+async def configure_duo_chunking(config: Dict):
+    """Configure Duo chunking parameters"""
+    
+    if 'chunk_size' in config:
+        duo_rest_analyzer.chunk_size = config['chunk_size']
+    
+    if 'max_retries' in config:
+        duo_rest_analyzer.max_retries = config['max_retries']
+    
+    if 'timeout_seconds' in config:
+        duo_rest_analyzer.timeout_seconds = config['timeout_seconds']
+    
+    return {
+        'chunk_size': duo_rest_analyzer.chunk_size,
+        'max_retries': duo_rest_analyzer.max_retries,
+        'timeout_seconds': duo_rest_analyzer.timeout_seconds
+    }
+
+
+async def run_chunked_duo_analysis(session_id: str, analysis_results: Dict):
+    """Background task for chunked Duo analysis"""
+    try:
+        # Get error groups from results
+        error_groups = analysis_results.get('problems', [])
+        
+        if not error_groups:
+            # Try alternative keys
+            error_groups = analysis_results.get('error_groups', [])
+        
+        if not error_groups:
+            raise Exception("No error groups found in analysis results")
+        
+        print(f"🤖 Starting chunked GitLab Duo analysis for {len(error_groups)} error patterns...")
+        
+        # Feed to Duo using chunked approach
+        result = await duo_rest_analyzer.feed_errors_chunked(session_id, error_groups)
+        
+        # Store in session
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_analysis'] = result
+        
+        print(f"✅ Chunked Duo analysis completed for session: {session_id}")
+        
+    except Exception as e:
+        print(f"❌ Chunked Duo analysis failed: {e}")
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_analysis'] = {
+                'status': 'failed',
+                'error': str(e)
+            }
+
+
 @app.get("/api/logs/{session_id}/{file_path:path}/raw")
 async def get_raw_log(session_id: str, file_path: str):
     """Stream raw file - handles nested paths correctly"""
@@ -4301,6 +4766,7 @@ async def extract_log_fields(
         
     except Exception as e:
         raise HTTPException(500, f"Error extracting fields: {str(e)}")
+
 
 
 def ensure_localhost_only():

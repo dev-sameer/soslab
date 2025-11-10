@@ -5,8 +5,10 @@ import {
     Zap, Package, AlertTriangle, XCircle,
     Info, BarChart3, Search,
     FileText, Copy, CheckCircle,
-    Link2, Terminal, Code2, Clock, Hash
+    Link2, Terminal, Code2, Clock, Hash,
+    Sparkles, Bot, Loader2
 } from 'lucide-react';
+import AIAnalysisDisplay from './AIAnalysisDisplay';
 
 const AutoAnalysis = ({ sessionId }) => {
     const [analysisState, setAnalysisState] = useState(null);
@@ -15,6 +17,7 @@ const AutoAnalysis = ({ sessionId }) => {
     const [copiedIndex, setCopiedIndex] = useState(null);
     const wsRef = useRef(null);
     const reconnectTimeoutRef = useRef(null);
+    const duoPollIntervalRef = useRef(null);
 
     const [filters, setFilters] = useState({
         severity: 'all',
@@ -24,7 +27,10 @@ const AutoAnalysis = ({ sessionId }) => {
         minCount: 1
     });
     const [viewMode, setViewMode] = useState('errors');
+    const [activeTab, setActiveTab] = useState('errors');
     const [errorLimit, setErrorLimit] = useState(25);
+    const [duoAnalysis, setDuoAnalysis] = useState(null);
+    const [isDuoAnalyzing, setIsDuoAnalyzing] = useState(false);
 
     // WebSocket connection for real-time updates
     const connectWebSocket = useCallback(() => {
@@ -89,7 +95,18 @@ const AutoAnalysis = ({ sessionId }) => {
             }
         };
 
+        // Check both auto-analysis and Duo status on mount
         loadState();
+        
+        // Check for existing Duo analysis
+        fetch(`/api/auto-analysis/${sessionId}/duo-status`)
+            .then(res => res.json())
+            .then(data => {
+                if (data.status !== 'not_started' && data.status !== 'not_available') {
+                    setDuoAnalysis(data);
+                }
+            })
+            .catch(console.error);
 
         // Cleanup
         return () => {
@@ -99,6 +116,10 @@ const AutoAnalysis = ({ sessionId }) => {
             }
             if (reconnectTimeoutRef.current) {
                 clearTimeout(reconnectTimeoutRef.current);
+            }
+            if (duoPollIntervalRef.current) {
+                clearInterval(duoPollIntervalRef.current);
+                duoPollIntervalRef.current = null;
             }
         };
     }, [sessionId, connectWebSocket]);
@@ -159,6 +180,602 @@ const AutoAnalysis = ({ sessionId }) => {
         a.download = `gitlab_errors_${new Date().toISOString().split('T')[0]}.json`;
         a.click();
         URL.revokeObjectURL(url);
+    };
+
+    const clearDuoAnalysisEnhanced = async () => {
+        try {
+            await fetch(`/api/auto-analysis/${sessionId}/duo-clear-enhanced`, {
+                method: 'DELETE'
+            });
+            setDuoAnalysis(null);
+            setIsDuoAnalyzing(false);
+            
+            // Clear any polling intervals
+            if (duoPollIntervalRef.current) {
+                clearInterval(duoPollIntervalRef.current);
+                duoPollIntervalRef.current = null;
+            }
+        } catch (error) {
+            console.error('Failed to clear Duo analysis:', error);
+        }
+    };
+
+    const startDuoAnalysisEnhanced = async () => {
+        try {
+            setIsDuoAnalyzing(true);
+            setActiveTab('ai'); // Switch to AI tab
+            
+            // Clear any existing failed analysis
+            if (duoAnalysis?.status === 'failed' || duoAnalysis?.status === 'partial') {
+                await clearDuoAnalysisEnhanced();
+            }
+            
+            // Start chunked analysis
+            const response = await fetch(`/api/auto-analysis/${sessionId}/duo-feed-chunked`, {
+                method: 'POST'
+            });
+            
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
+            
+            // Set up WebSocket for real-time updates
+            const ws = new WebSocket(`ws://localhost:8000/ws/duo-analysis/${sessionId}`);
+            
+            ws.onopen = () => {
+                console.log('Connected to Duo analysis WebSocket');
+            };
+            
+            ws.onmessage = (event) => {
+                const status = JSON.parse(event.data);
+                console.log('Duo status update:', status);
+                
+                // Update state with real-time progress
+                setDuoAnalysis(status);
+                
+                if (status.status === 'completed' || status.status === 'failed' || status.status === 'partial') {
+                    setIsDuoAnalyzing(false);
+                    ws.close();
+                }
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                setIsDuoAnalyzing(false);
+            };
+            
+            ws.onclose = () => {
+                console.log('Duo WebSocket closed');
+                // Fallback to polling if WebSocket fails
+                if (isDuoAnalyzing) {
+                    startPolling();
+                }
+            };
+            
+        } catch (error) {
+            console.error('Duo analysis failed:', error);
+            setIsDuoAnalyzing(false);
+            alert(`Failed to start Duo analysis: ${error.message}`);
+        }
+    };
+
+    const startPolling = () => {
+        // Fallback polling mechanism
+        const pollInterval = setInterval(async () => {
+            try {
+                const statusResp = await fetch(`/api/auto-analysis/${sessionId}/duo-status-enhanced`);
+                const status = await statusResp.json();
+                
+                console.log('Duo poll status:', status);
+                setDuoAnalysis(status);
+                
+                if (status.status === 'completed' || status.status === 'failed' || status.status === 'partial') {
+                    clearInterval(pollInterval);
+                    setIsDuoAnalyzing(false);
+                }
+            } catch (error) {
+                console.error('Polling error:', error);
+            }
+        }, 2000); // Poll every 2 seconds
+        
+        // Store interval for cleanup
+        duoPollIntervalRef.current = pollInterval;
+    };
+
+    const startRESTPolling = () => {
+        const pollInterval = setInterval(async () => {
+            try {
+                const response = await fetch(`/api/auto-analysis/${sessionId}/duo-rest-status`);
+                const status = await response.json();
+                
+                console.log('Duo REST poll status:', status);
+                setDuoAnalysis(status);
+                
+                if (status.status === 'completed' || status.status === 'failed' || status.status === 'partial') {
+                    clearInterval(pollInterval);
+                    setIsDuoAnalyzing(false);
+                }
+            } catch (error) {
+                console.error('Polling error:', error);
+            }
+        }, 2000);
+        
+        duoPollIntervalRef.current = pollInterval;
+    };
+
+    const clearDuoRESTAnalysis = async () => {
+        try {
+            const response = await fetch(`/api/auto-analysis/${sessionId}/duo-rest-clear`, {
+                method: 'DELETE'
+            });
+            
+            const result = await response.json();
+            console.log('Clear result:', result);
+            
+            // Reset state
+            setDuoAnalysis(null);
+            setIsDuoAnalyzing(false);
+            
+            // Clear any polling
+            if (duoPollIntervalRef.current) {
+                clearInterval(duoPollIntervalRef.current);
+                duoPollIntervalRef.current = null;
+            }
+        } catch (error) {
+            console.error('Failed to clear analysis:', error);
+        }
+    };
+
+    const startDuoRESTAnalysis = async () => {
+        try {
+            setIsDuoAnalyzing(true);
+            setActiveTab('ai'); // Switch to AI tab
+            
+            // Start REST API analysis
+            const response = await fetch(`/api/auto-analysis/${sessionId}/duo-rest-analyze`, {
+                method: 'POST'
+            });
+            
+            if (!response.ok) {
+                const error = await response.text();
+                throw new Error(error);
+            }
+            
+            // Set up WebSocket for real-time updates
+            const ws = new WebSocket(`ws://localhost:8000/ws/duo-rest/${sessionId}`);
+            
+            ws.onopen = () => {
+                console.log('Connected to Duo REST WebSocket');
+            };
+            
+            ws.onmessage = (event) => {
+                const status = JSON.parse(event.data);
+                console.log('Duo REST status:', status);
+                
+                // Update state with real-time progress
+                setDuoAnalysis(status);
+                
+                // Stop when complete
+                if (status.status === 'completed' || status.status === 'failed' || status.status === 'partial') {
+                    setIsDuoAnalyzing(false);
+                    ws.close();
+                }
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                setIsDuoAnalyzing(false);
+                // Fallback to polling
+                startRESTPolling();
+            };
+            
+            ws.onclose = () => {
+                console.log('Duo REST WebSocket closed');
+                // Fetch final status in case WebSocket closed before last update
+                setTimeout(async () => {
+                    try {
+                        const response = await fetch(`/api/auto-analysis/${sessionId}/duo-rest-status`);
+                        const finalStatus = await response.json();
+                        console.log('Final status after WS close:', finalStatus);
+                        setDuoAnalysis(finalStatus);
+                        if (finalStatus.status === 'completed' || finalStatus.status === 'failed') {
+                            setIsDuoAnalyzing(false);
+                        }
+                    } catch (error) {
+                        console.error('Error fetching final status:', error);
+                    }
+                }, 500); // Wait 500ms before fetching
+            };
+            
+        } catch (error) {
+            console.error('Failed to start Duo REST analysis:', error);
+            setIsDuoAnalyzing(false);
+            alert(`Failed to start AI analysis: ${error.message}`);
+        }
+    };
+
+    // Enhanced AI Analysis UI Component
+    const renderAIAnalysisTab = () => (
+        <div className="space-y-4">
+            {/* Header with Controls */}
+            <div className="p-4 rounded-lg" style={{ 
+                background: 'var(--bg-secondary)', 
+                border: '1px solid var(--border-primary)' 
+            }}>
+                <div className="flex justify-between items-center">
+                    <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-lg flex items-center justify-center"
+                            style={{ 
+                                background: 'var(--accent)',
+                                color: 'var(--bg-primary)'
+                            }}>
+                            <Bot className="w-5 h-5" />
+                        </div>
+                        <div>
+                            <h3 className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>
+                                GitLab Duo AI Analysis
+                            </h3>
+                            <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                                REST API with intelligent batching
+                            </p>
+                        </div>
+                    </div>
+                    
+                    <div className="flex gap-2">
+                        {/* Test Connection Button */}
+                        <button
+                            onClick={async () => {
+                                const res = await fetch('/api/duo/test-connection');
+                                const data = await res.json();
+                                alert(data.connected ? 'Connection successful!' : `Connection failed: ${data.error}`);
+                            }}
+                            className="px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+                            style={{ 
+                                background: 'var(--bg-primary)',
+                                color: 'var(--text-secondary)',
+                                border: '1px solid var(--border-primary)'
+                            }}>
+                            <Link2 className="w-3 h-3" />
+                            Test
+                        </button>
+                        
+                        {/* Clear Button */}
+                        {duoAnalysis && duoAnalysis.status !== 'not_started' && (
+                            <button
+                                onClick={clearDuoRESTAnalysis}
+                                disabled={isDuoAnalyzing}
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+                                style={{ 
+                                    background: '#ef4444',
+                                    color: 'white',
+                                    opacity: isDuoAnalyzing ? 0.5 : 1
+                                }}>
+                                <XCircle className="w-3 h-3" />
+                                Clear
+                            </button>
+                        )}
+                        
+                        {/* Start/Retry Button */}
+                        <button
+                            onClick={startDuoRESTAnalysis}
+                            disabled={isDuoAnalyzing || analysisState?.status !== 'completed'}
+                            className="px-4 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+                            style={{ 
+                                background: 'var(--accent)',
+                                color: 'var(--bg-primary)',
+                                opacity: (isDuoAnalyzing || analysisState?.status !== 'completed') ? 0.5 : 1
+                            }}>
+                            {isDuoAnalyzing ? (
+                                <>
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                    Analyzing...
+                                </>
+                            ) : duoAnalysis?.status === 'failed' ? (
+                                <>
+                                    <RefreshCw className="w-3.5 h-3.5" />
+                                    Retry Analysis
+                                </>
+                            ) : (
+                                <>
+                                    <Sparkles className="w-3.5 h-3.5" />
+                                    Start AI Analysis
+                                </>
+                            )}
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            {/* Status Content */}
+            {!duoAnalysis || duoAnalysis.status === 'not_started' ? (
+                <div className="text-center py-12">
+                    <Bot className="w-16 h-16 mx-auto mb-4" style={{ color: 'var(--text-tertiary)' }} />
+                    <h3 className="text-lg font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>
+                        Ready for AI Analysis
+                    </h3>
+                    <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                        Click "Start AI Analysis" to get comprehensive insights from GitLab Duo
+                    </p>
+                    <div className="mt-6 space-y-2 text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                        <p>✓ REST API integration</p>
+                        <p>✓ Intelligent batching for large datasets</p>
+                        <p>✓ Comprehensive root cause analysis</p>
+                    </div>
+                </div>
+            ) : duoAnalysis.status === 'processing' ? (
+                <div className="rounded-xl p-6" style={{ 
+                    background: 'var(--bg-secondary)',
+                    border: '1px solid rgba(0,0,0,0.06)',
+                    boxShadow: '0 2px 8px rgba(0,0,0,0.04)'
+                }}>
+                    <div className="space-y-4">
+                        {/* Progress Header - Monochrome */}
+                        <div className="flex items-start gap-3">
+                            <div className="w-10 h-10 rounded-lg flex items-center justify-center" style={{
+                                background: 'var(--accent)',
+                                color: 'var(--bg-primary)',
+                                boxShadow: '0 2px 6px rgba(0,0,0,0.08)'
+                            }}>
+                                <Loader2 className="w-5 h-5 animate-spin" strokeWidth={2} />
+                            </div>
+                            <div className="flex-1">
+                                <h3 className="font-semibold mb-1" style={{ 
+                                    color: 'var(--text-primary)',
+                                    fontSize: '14px',
+                                    fontWeight: '600',
+                                    letterSpacing: '-0.01em'
+                                }}>
+                                    Analyzing Error Patterns
+                                </h3>
+                                <p className="text-sm" style={{ 
+                                    color: 'var(--text-secondary)',
+                                    fontSize: '12px',
+                                    letterSpacing: '0.01em'
+                                }}>
+                                    {duoAnalysis.current_message || 'Processing...'}
+                                </p>
+                            </div>
+                        </div>
+                        
+                        {/* Pattern Progress - Monochrome Style */}
+                        {duoAnalysis.patterns_total > 0 && (
+                            <div className="space-y-3">
+                                <div className="flex justify-between text-xs" style={{ 
+                                    color: 'var(--text-secondary)',
+                                    fontSize: '11px',
+                                    fontWeight: '500',
+                                    letterSpacing: '0.02em'
+                                }}>
+                                    <span>Analyzing Patterns</span>
+                                    <span className="font-mono" style={{ fontWeight: '600' }}>
+                                        {duoAnalysis.patterns_analyzed || 0} / {duoAnalysis.patterns_total}
+                                    </span>
+                                </div>
+                                
+                                {/* Progress Bar - Monochrome */}
+                                <div className="h-2 rounded-full overflow-hidden" 
+                                    style={{ 
+                                        background: 'rgba(0,0,0,0.04)',
+                                        border: '1px solid rgba(0,0,0,0.06)'
+                                    }}>
+                                    <div 
+                                        className="h-full rounded-full transition-all duration-500"
+                                        style={{ 
+                                            width: `${((duoAnalysis.patterns_analyzed || 0) / duoAnalysis.patterns_total) * 100}%`,
+                                            background: 'var(--accent)',
+                                            boxShadow: '0 0 8px rgba(0,0,0,0.1)'
+                                        }} 
+                                    />
+                                </div>
+                            </div>
+                        )}
+                        
+                        {/* Stats Grid - Monochrome */}
+                        <div className="grid grid-cols-3 gap-3">
+                            <div className="text-center p-3 rounded-lg" style={{ 
+                                background: 'var(--bg-primary)',
+                                border: '1px solid rgba(0,0,0,0.06)'
+                            }}>
+                                <div className="text-lg font-bold" style={{ 
+                                    color: 'var(--text-primary)',
+                                    fontSize: '18px',
+                                    fontWeight: '700',
+                                    letterSpacing: '-0.02em'
+                                }}>
+                                    {duoAnalysis.unique_patterns || 0}
+                                </div>
+                                <div className="text-xs" style={{ 
+                                    color: 'var(--text-tertiary)',
+                                    fontSize: '10px',
+                                    fontWeight: '500',
+                                    letterSpacing: '0.03em',
+                                    textTransform: 'uppercase',
+                                    marginTop: '4px'
+                                }}>
+                                    Patterns
+                                </div>
+                            </div>
+                            <div className="text-center p-3 rounded-lg" style={{ 
+                                background: 'var(--bg-primary)',
+                                border: '1px solid rgba(0,0,0,0.06)'
+                            }}>
+                                <div className="text-lg font-bold" style={{ 
+                                    color: '#ef4444',
+                                    fontSize: '18px',
+                                    fontWeight: '700',
+                                    letterSpacing: '-0.02em'
+                                }}>
+                                    {duoAnalysis.total_errors || 0}
+                                </div>
+                                <div className="text-xs" style={{ 
+                                    color: 'var(--text-tertiary)',
+                                    fontSize: '10px',
+                                    fontWeight: '500',
+                                    letterSpacing: '0.03em',
+                                    textTransform: 'uppercase',
+                                    marginTop: '4px'
+                                }}>
+                                    Total Errors
+                                </div>
+                            </div>
+                            <div className="text-center p-3 rounded-lg" style={{ 
+                                background: 'var(--bg-primary)',
+                                border: '1px solid rgba(0,0,0,0.06)'
+                            }}>
+                                <div className="text-lg font-bold" style={{ 
+                                    color: 'var(--accent)',
+                                    fontSize: '18px',
+                                    fontWeight: '700',
+                                    letterSpacing: '-0.02em'
+                                }}>
+                                    {Math.round(((duoAnalysis.patterns_analyzed || 0) / Math.max(duoAnalysis.patterns_total || 1, 1)) * 100)}%
+                                </div>
+                                <div className="text-xs" style={{ 
+                                    color: 'var(--text-tertiary)',
+                                    fontSize: '10px',
+                                    fontWeight: '500',
+                                    letterSpacing: '0.03em',
+                                    textTransform: 'uppercase',
+                                    marginTop: '4px'
+                                }}>
+                                    Progress
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            ) : duoAnalysis.status === 'completed' ? (
+                <AIAnalysisDisplay 
+                    duoAnalysis={duoAnalysis}
+                    onExport={() => {
+                        // Export all analyses as markdown
+                        const markdown = duoAnalysis.analyses.map((a, idx) => {
+                            return `# Pattern ${a.pattern_number}: ${a.error.component}\n\n` +
+                                   `**Severity:** ${a.error.severity}\n` +
+                                   `**Occurrences:** ${a.error.count}\n` +
+                                   `**Error:** ${a.error.message}\n\n` +
+                                   `## AI Analysis\n\n${a.analysis}\n\n---\n\n`;
+                        }).join('\n');
+                        
+                        const blob = new Blob([markdown], { type: 'text/markdown' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `duo_analysis_${sessionId}.md`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                    }}
+                />
+            ) : duoAnalysis.status === 'failed' ? (
+                <div className="rounded-lg p-6 bg-red-50 border border-red-200">
+                    <div className="flex items-start gap-3">
+                        <XCircle className="w-5 h-5 text-red-600 mt-1" />
+                        <div className="flex-1">
+                            <h3 className="font-semibold text-red-900 mb-2">Analysis Failed</h3>
+                            <p className="text-sm text-red-700">
+                                {duoAnalysis.error || 'An error occurred during analysis'}
+                            </p>
+                            <button
+                                onClick={startDuoRESTAnalysis}
+                                className="mt-3 px-4 py-2 bg-red-600 text-white rounded-lg text-xs font-medium">
+                                <RefreshCw className="w-3 h-3 inline mr-1" />
+                                Retry Analysis
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            ) : null}
+        </div>
+    );
+
+    // Replace the existing button with this enhanced version
+    const renderAIAnalysisButton = () => (
+        <button 
+            onClick={startDuoRESTAnalysis}
+            disabled={isDuoAnalyzing || analysisState?.status !== 'completed'}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 disabled:opacity-50"
+            style={{ 
+                background: duoAnalysis?.status === 'failed' || duoAnalysis?.status === 'partial'
+                    ? '#ef4444' 
+                    : 'var(--accent)',
+                color: duoAnalysis?.status === 'failed' || duoAnalysis?.status === 'partial'
+                    ? 'white'
+                    : 'var(--bg-primary)',
+                opacity: isDuoAnalyzing ? 0.7 : 1
+            }}
+        >
+            {isDuoAnalyzing ? (
+                <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    AI Analyzing...
+                </>
+            ) : duoAnalysis?.status === 'failed' || duoAnalysis?.status === 'partial' ? (
+                <>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Retry AI Analysis
+                </>
+            ) : (
+                <>
+                    <Sparkles className="w-3.5 h-3.5" />
+                    AI Analysis
+                </>
+            )}
+        </button>
+    );
+
+    // Enhanced status display for partial completion
+    const renderAnalysisStatus = () => {
+        if (duoAnalysis?.status === 'partial') {
+            return (
+                <div className="rounded-lg p-4" style={{ 
+                    background: 'rgba(245, 158, 11, 0.1)',
+                    border: '1px solid #f59e0b'
+                }}>
+                    <div className="flex items-start justify-between">
+                        <div className="flex-1">
+                            <h3 className="font-semibold text-yellow-600 mb-2">Partial Analysis Complete</h3>
+                            <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                                {duoAnalysis.chunks_succeeded}/{duoAnalysis.chunks_total} chunks processed successfully.
+                            </p>
+                            {duoAnalysis.analysis && (
+                                <div className="mt-3 p-3 rounded" style={{ background: 'var(--bg-primary)' }}>
+                                    <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                                        Partial results available below
+                                    </p>
+                                </div>
+                            )}
+                        </div>
+                        <div className="flex gap-2">
+                            <button 
+                                onClick={clearDuoAnalysisEnhanced}
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                                style={{ 
+                                    background: 'var(--bg-primary)',
+                                    color: 'var(--text-primary)',
+                                    border: '1px solid var(--border-primary)'
+                                }}
+                            >
+                                Clear
+                            </button>
+                            <button 
+                                onClick={startDuoAnalysisEnhanced}
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+                                style={{ 
+                                    background: 'var(--accent)',
+                                    color: 'white'
+                                }}
+                            >
+                                <RefreshCw className="w-3.5 h-3.5" />
+                                Retry
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+        
+        // Return existing status displays for other states
+        return null;
     };
 
     const copyToClipboard = async (text, index) => {
@@ -333,6 +950,7 @@ const AutoAnalysis = ({ sessionId }) => {
                                     <Download className="w-3.5 h-3.5" />
                                     Export
                                 </button>
+                                {renderAIAnalysisButton()}
                                 <button onClick={clearAnalysis}
                                     className="px-3 py-1.5 rounded-lg text-xs font-medium"
                                     style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)', border: '1px solid var(--border-primary)' }}>
@@ -456,17 +1074,18 @@ const AutoAnalysis = ({ sessionId }) => {
 
                         {/* View Tabs */}
                         <div className="flex gap-1.5 mb-3">
-                            {['errors', 'dashboard', 'raw'].map(mode => (
-                                <button key={mode} onClick={() => setViewMode(mode)}
+                            {['errors', 'dashboard', 'raw', 'ai'].map(mode => (
+                                <button key={mode} onClick={() => { setActiveTab(mode); setViewMode(mode); }}
                                     className="px-3 py-1.5 rounded-lg text-[11px] font-medium capitalize"
                                     style={{
-                                        background: viewMode === mode ? 'var(--accent)' : 'var(--bg-primary)',
-                                        color: viewMode === mode ? 'var(--bg-primary)' : 'var(--text-primary)',
+                                        background: activeTab === mode ? 'var(--accent)' : 'var(--bg-primary)',
+                                        color: activeTab === mode ? 'var(--bg-primary)' : 'var(--text-primary)',
                                         border: '1px solid var(--border-primary)'
                                     }}>
                                     {mode === 'errors' && <AlertCircle className="w-3 h-3 inline mr-1" />}
                                     {mode === 'dashboard' && <BarChart3 className="w-3 h-3 inline mr-1" />}
                                     {mode === 'raw' && <Code2 className="w-3 h-3 inline mr-1" />}
+                                    {mode === 'ai' && <Bot className="w-3 h-3 inline mr-1" />}
                                     {mode}
                                 </button>
                             ))}
@@ -658,24 +1277,18 @@ const AutoAnalysis = ({ sessionId }) => {
                                                             </div>
 
                                                             {/* Smart message display */}
-                                                            {isLongOrTechnical ? (
-                                                                <pre className="p-2 rounded font-mono" style={{
-                                                                    background: 'var(--bg-primary)',
-                                                                    fontSize: '11px',
-                                                                    color: 'var(--text-primary)',
-                                                                    whiteSpace: 'pre-wrap',
-                                                                    wordBreak: 'break-all',
-                                                                    maxHeight: '80px',
-                                                                    overflow: 'hidden',
-                                                                    border: '1px solid var(--border-primary)'
-                                                                }}>
-                                                                    {msg.length > 300 ? msg.substring(0, 300) + '...' : msg}
-                                                                </pre>
-                                                            ) : (
-                                                                <p className="font-medium" style={{ fontSize: '12px', color: 'var(--text-primary)', wordBreak: 'break-word' }}>
-                                                                    {msg}
-                                                                </p>
-                                                            )}
+                                                            <pre className="p-2 rounded font-mono" style={{
+                                                                background: 'var(--bg-primary)',
+                                                                fontSize: '11px',
+                                                                color: 'var(--text-primary)',
+                                                                whiteSpace: 'pre-wrap',
+                                                                wordBreak: 'break-all',
+                                                                maxHeight: isLongOrTechnical ? '80px' : 'none',
+                                                                overflow: isLongOrTechnical ? 'hidden' : 'visible',
+                                                                border: '1px solid var(--border-primary)'
+                                                            }}>
+                                                                {msg.length > 300 ? msg.substring(0, 300) + '...' : msg}
+                                                            </pre>
 
                                                             {firstProblem.files && firstProblem.files.length > 0 && (
                                                                 <div className="mt-1.5 flex items-center gap-1.5">
@@ -994,6 +1607,9 @@ const AutoAnalysis = ({ sessionId }) => {
                                 </pre>
                             </div>
                         )}
+
+                        {/* AI Analysis View */}
+                        {activeTab === 'ai' && renderAIAnalysisTab()}
                     </>
                 ) : null}
             </div>

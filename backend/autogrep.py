@@ -819,11 +819,20 @@ class TurboStreamProcessor:
         if line.strip().startswith('{'):
             try:
                 data = json.loads(line)
+                
+                # For exception.class, try to get the full message
+                exception_class = data.get('exception.class') or data.get('exception', {}).get('class')
+                exception_message = data.get('exception.message') or data.get('exception', {}).get('message')
+                
+                # Combine class and message if both exist
+                if exception_class and exception_message:
+                    return f"{exception_class}: {exception_message}"
+                
                 # Priority order for message extraction
                 message = (
+                    exception_message or
                     data.get('error_message') or
-                    data.get('exception', {}).get('message') or
-                    data.get('exception', {}).get('class') or
+                    exception_class or
                     data.get('error') or
                     data.get('msg') or
                     data.get('message', '')
@@ -1824,6 +1833,7 @@ class EnhancedPatternBank:
         """Build Aho-Corasick automaton for ultra-fast multi-pattern matching"""
         if not HAS_AHOCORASICK:
             return
+            
         self.automaton = pyahocorasick.Automaton()
         
         for pattern in self.patterns:
@@ -1942,12 +1952,16 @@ class TurboAutoGrep:
                     
                     # Stream to callback if provided
                     if callback:
-                        await callback(item['data'])
+                        result = callback(item['data'])
+                        if result and asyncio.iscoroutine(result):
+                            await result
                         
                 elif item['type'] == 'progress':
                     # Handle progress updates
                     if callback:
-                        await callback({'type': 'progress', **item})
+                        result = callback({'type': 'progress', **item})
+                        if result and asyncio.iscoroutine(result):
+                            await result
                         
             except Exception as e:
                 print(f"Collector error: {e}")
