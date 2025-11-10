@@ -1824,7 +1824,6 @@ class EnhancedPatternBank:
         """Build Aho-Corasick automaton for ultra-fast multi-pattern matching"""
         if not HAS_AHOCORASICK:
             return
-            
         self.automaton = pyahocorasick.Automaton()
         
         for pattern in self.patterns:
