@@ -819,7 +819,8 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                                                                     className="flex-1 px-4 whitespace-pre-wrap break-all"
                                                                     style={{
                                                                         color,
-                                                                        overflowWrap: 'anywhere'
+                                                                        overflowWrap: 'anywhere',
+                                                                        fontSize: '0.75rem'
                                                                     }}
                                                                 >
                                                                     {item.line}

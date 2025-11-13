@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-AUTOGREP - Enhanced GitLab Error Analyzer
-Smart context extraction, correlation tracking, and comprehensive pattern matching
+AUTOGREP - Enhanced GitLab Error Analyzer - TURBO EDITION
+Full context preservation, parallel processing, streaming results
+Complete implementation with all patterns
 """
 
 import os
@@ -20,13 +21,15 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Any, Iterator, NamedTuple, Union
 from collections import defaultdict, Counter, deque
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import multiprocessing as mp
 from queue import Queue, Empty
 import threading
 import heapq
+import asyncio
+from asyncio import Queue as AsyncQueue
 
 # Try to import optional performance libraries
 try:
@@ -60,114 +63,91 @@ class ErrorPattern:
     category: str
     severity: str = 'ERROR'
     description: str = ''
-    multiline: bool = False  # New: indicates if pattern typically spans multiple lines
-    correlation_extractors: List[str] = field(default_factory=list)  # New: patterns to extract correlation IDs
+    multiline: bool = False
+    correlation_extractors: List[str] = field(default_factory=list)
+    priority: int = 5  # 1-10, higher = more important
     
     def __hash__(self):
         return hash((self.id, self.pattern))
 
 
 @dataclass
-class ErrorContext:
-    """Enhanced error context with smart boundaries"""
-    start_line: int
-    end_line: int
-    lines: List[str]
-    format_type: str  # json, text, stacktrace, multiline
-    correlation_ids: Set[str]
-    related_entries: List[Dict[str, Any]]  # Other log entries with same correlation ID
-    metadata: Dict[str, Any]
-
-
-@dataclass
-class ErrorMatch:
-    """Enhanced error match with full context and correlation"""
+class EnhancedErrorMatch:
+    """Complete error match with ALL context preserved"""
     pattern: ErrorPattern
     matched_text: str
-    line: str
+    clean_message: str  # The extracted, clean error message
+    full_line: str  # Complete original line
     file_path: str
     line_number: int
     timestamp: Optional[datetime] = None
     node: str = 'unknown'
-    context_before: List[str] = field(default_factory=list)
-    context_after: List[str] = field(default_factory=list)
-    correlation_id: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    confidence: float = 1.0
-    signature: Optional[str] = None
     
-    # New enhanced fields
-    full_context: Optional[ErrorContext] = None
-    error_message: Optional[str] = None  # Extracted actual error message
-    stack_trace: Optional[List[str]] = None  # Full stack trace if present
-    related_errors: List['ErrorMatch'] = field(default_factory=list)  # Correlated errors
-    error_code: Optional[str] = None  # HTTP status, GRPC code, etc
+    # Full context preservation
+    context_before: List[str] = field(default_factory=list)  # Up to 10 lines before
+    context_after: List[str] = field(default_factory=list)   # Up to 10 lines after
+    full_context_text: str = ''  # Full multi-line error (for stack traces)
+    
+    # Correlation and metadata
+    correlation_id: Optional[str] = None
     request_id: Optional[str] = None
     user_id: Optional[str] = None
     project_id: Optional[str] = None
-    duration_ms: Optional[float] = None
+    job_id: Optional[str] = None
+    trace_id: Optional[str] = None
+    
+    # Enhanced metadata
+    error_code: Optional[str] = None  # HTTP status, GRPC code, etc
+    stack_trace: Optional[List[str]] = None  # Full parsed stack trace
+    json_fields: Dict[str, Any] = field(default_factory=dict)  # All JSON fields if applicable
+    
+    # Performance metadata
+    signature: Optional[str] = None
+    confidence: float = 1.0
+    processing_time_ms: float = 0
     
     def __post_init__(self):
         if not self.signature:
             self.signature = self._generate_signature()
-        if not self.error_message:
-            self.error_message = self._extract_error_message()
     
     def _generate_signature(self) -> str:
         """Generate unique signature for error clustering"""
-        clean_text = re.sub(r'\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}', '', self.matched_text)
+        clean_text = re.sub(r'\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}', '', self.clean_message or self.matched_text)
         clean_text = re.sub(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', 'UUID', clean_text)
         clean_text = re.sub(r'\b\d+\b', 'N', clean_text)
         
         sig_input = f"{self.pattern.component}:{self.pattern.id}:{clean_text[:100]}"
         return hashlib.md5(sig_input.encode()).hexdigest()[:16]
     
-    def _extract_error_message(self) -> str:
-        """Smart extraction of actual error message"""
-        if self.full_context and self.full_context.format_type == 'json':
-            return self._extract_from_json()
-        elif self.stack_trace:
-            return self.stack_trace[0] if self.stack_trace else self.matched_text
-        else:
-            return self._extract_from_text()
-    
-    def _extract_from_json(self) -> str:
-        """Extract error message from JSON logs"""
-        if not self.full_context:
-            return self.matched_text
-            
-        for line in self.full_context.lines:
-            if line.strip().startswith('{'):
-                try:
-                    data = json.loads(line)
-                    # Priority order for error message extraction
-                    return (data.get('error') or 
-                           data.get('message') or 
-                           data.get('msg') or 
-                           data.get('error_message') or
-                           data.get('exception', {}).get('message') or
-                           data.get('exception', {}).get('class') or
-                           self.matched_text)
-                except:
-                    pass
-        return self.matched_text
-    
-    def _extract_from_text(self) -> str:
-        """Extract error message from text logs"""
-        patterns = [
-            r'(?:ERROR|FATAL|CRITICAL)[:\s]+(.+?)(?:\n|$)',
-            r'(?:error|exception)[:\s]+([^,\n]+)',
-            r'message[:\s]+["\']([^"\']+)',
-            r'msg[:\s]+["\']([^"\']+)'
-        ]
-        
-        text = self.full_context.lines[0] if self.full_context else self.line
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-        
-        return self.matched_text
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization"""
+        return {
+            'pattern_id': self.pattern.id,
+            'pattern_description': self.pattern.description,
+            'component': self.pattern.component,
+            'severity': self.pattern.severity,
+            'message': self.clean_message,  # CRITICAL: Clean message for UI
+            'full_line': self.full_line,    # Full line for reference
+            'matched_text': self.matched_text,
+            'file_path': self.file_path,
+            'line_number': self.line_number,
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'node': self.node,
+            'context_before': self.context_before,
+            'context_after': self.context_after,
+            'full_context': self.full_context_text,
+            'correlation_id': self.correlation_id,
+            'request_id': self.request_id,
+            'user_id': self.user_id,
+            'project_id': self.project_id,
+            'job_id': self.job_id,
+            'trace_id': self.trace_id,
+            'error_code': self.error_code,
+            'stack_trace': self.stack_trace,
+            'json_fields': self.json_fields,
+            'signature': self.signature,
+            'confidence': self.confidence
+        }
 
 
 class LogBoundaryDetector:
@@ -228,10 +208,11 @@ class LogBoundaryDetector:
         else:
             return 'text'
     
-    def find_boundaries(self, lines: List[str], match_line: int) -> Tuple[int, int]:
-        """Find the actual boundaries of an error"""
+    def find_boundaries(self, lines: List[str], match_line: int) -> Tuple[int, int, str]:
+        """Find the actual boundaries of an error and its format"""
         start = match_line
         end = match_line
+        format_type = self.detect_format(lines[match_line] if match_line < len(lines) else '')
         
         # Find start by going backwards
         for i in range(match_line - 1, max(0, match_line - 100), -1):
@@ -272,7 +253,7 @@ class LogBoundaryDetector:
             # Check if we hit a new log entry
             for pattern in self.compiled_end:
                 if pattern.match(line):
-                    return start, end
+                    return start, end, format_type
             
             # Check if this is continuation
             is_continuation = any(p.match(line) for p in self.compiled_continuation)
@@ -292,7 +273,7 @@ class LogBoundaryDetector:
                 # Non-continuation content, stop here
                 break
         
-        return start, end
+        return start, end, format_type
 
 
 class CorrelationTracker:
@@ -333,343 +314,6 @@ class CorrelationTracker:
     def get_related_entries(self, correlation_id: str) -> List[Dict[str, Any]]:
         """Get all log entries with the same correlation ID"""
         return self.id_to_entries.get(correlation_id, [])
-    
-    def find_related_errors(self, error_match: ErrorMatch) -> List[Dict[str, Any]]:
-        """Find all related log entries for an error"""
-        related = []
-        if error_match.correlation_id:
-            related.extend(self.get_related_entries(error_match.correlation_id))
-        if error_match.request_id:
-            related.extend(self.get_related_entries(error_match.request_id))
-        
-        # Deduplicate
-        seen = set()
-        unique_related = []
-        for entry in related:
-            key = f"{entry['file']}:{entry['line_num']}"
-            if key not in seen:
-                seen.add(key)
-                unique_related.append(entry)
-        
-        return unique_related
-
-
-class EnhancedStreamProcessor:
-    """Enhanced memory-efficient streaming log processor with smart context extraction"""
-    
-    def __init__(self, pattern_bank: 'PatternBank', false_positive_filter: 'FalsePositiveFilter' = None):
-        self.pattern_bank = pattern_bank
-        self.false_positive_filter = false_positive_filter or FalsePositiveFilter()
-        self.boundary_detector = LogBoundaryDetector()
-        self.correlation_tracker = CorrelationTracker()
-        self.line_number = 0
-        self.file_lines_cache = []  # Cache for boundary detection
-        
-    def process_file(self, file_path: Path, chunk_size: int = 8192) -> Iterator[ErrorMatch]:
-        """Enhanced file processing with smart context extraction"""
-        self.line_number = 0
-        self.file_lines_cache = []
-        
-        # Skip schema files entirely
-        if self.false_positive_filter.is_schema_file(file_path):
-            return
-        
-        # Skip system info files unless they have specific errors
-        if self.false_positive_filter.is_system_info_file(file_path):
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line_num, line in enumerate(f, 1):
-                        if 'No such file or directory' in line and 'command not found' not in line:
-                            yield ErrorMatch(
-                                pattern=ErrorPattern('system_error', 'No such file', 'System/OS', 'system', 'ERROR'),
-                                matched_text=line.strip(),
-                                line=line.strip(),
-                                file_path=str(file_path),
-                                line_number=line_num,
-                                node=self._extract_node(file_path)
-                            )
-            except:
-                pass
-            return
-        
-        # Check if it's a config file
-        if self.false_positive_filter.is_config_file(file_path):
-            return
-        
-        try:
-            # First pass: Load file and build correlation index
-            if str(file_path).endswith('.gz'):
-                with gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                    self.file_lines_cache = f.readlines()
-            else:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    self.file_lines_cache = f.readlines()
-            
-            # Build correlation index
-            for idx, line in enumerate(self.file_lines_cache):
-                self.correlation_tracker.extract_ids(line, idx, str(file_path))
-            
-            # Second pass: Process errors with full context
-            for idx, line in enumerate(self.file_lines_cache):
-                self.line_number = idx + 1
-                
-                # Quick pre-filter
-                if not self._should_process_line(line, file_path):
-                    continue
-                
-                # Check patterns with enhanced matching
-                matches = self._check_patterns_enhanced(line, idx, file_path)
-                for match in matches:
-                    yield match
-                    
-        except Exception as e:
-            print(f"⚠️  Error processing {file_path}: {e}")
-    
-    def _check_patterns_enhanced(self, line: str, line_idx: int, file_path: Path) -> List[ErrorMatch]:
-        """Enhanced pattern checking with smart context extraction"""
-        matches = []
-        
-        # Check if it's from monitoring service
-        is_monitoring, monitoring_service = self.false_positive_filter.is_monitoring_service_error(line, str(file_path))
-        
-        # Check each pattern
-        for pattern in self.pattern_bank.patterns:
-            if pattern.id in self.pattern_bank.compiled_patterns:
-                regex = self.pattern_bank.compiled_patterns[pattern.id]
-                if match := regex.search(line):
-                    # Validate match
-                    if not self._validate_match(line, match.group(0), file_path):
-                        continue
-                    
-                    # Find error boundaries
-                    start, end = self.boundary_detector.find_boundaries(
-                        self.file_lines_cache, line_idx
-                    )
-                    
-                    # Extract full context
-                    context_lines = self.file_lines_cache[start:end+1]
-                    format_type = self.boundary_detector.detect_format(line)
-                    
-                    # Extract correlation IDs from context
-                    correlation_ids = set()
-                    for ctx_line in context_lines:
-                        ids = self.correlation_tracker.extract_ids(
-                            ctx_line, start + context_lines.index(ctx_line), str(file_path)
-                        )
-                        correlation_ids.update(ids)
-                    
-                    # Create enhanced error match
-                    error_match = self._create_enhanced_match(
-                        pattern, match, line, file_path, line_idx,
-                        context_lines, format_type, correlation_ids
-                    )
-                    
-                    error_match.metadata['is_monitoring'] = is_monitoring
-                    error_match.metadata['monitoring_service'] = monitoring_service
-                    
-                    # Extract additional fields
-                    self._extract_additional_fields(error_match)
-                    
-                    matches.append(error_match)
-                    break  # One match per line for now
-        
-        return matches
-    
-    def _create_enhanced_match(self, pattern: ErrorPattern, regex_match, line: str, 
-                               file_path: Path, line_idx: int, context_lines: List[str],
-                               format_type: str, correlation_ids: Set[str]) -> ErrorMatch:
-        """Create enhanced ErrorMatch with full context"""
-        
-        # Extract stack trace if present
-        stack_trace = self._extract_stack_trace(context_lines, format_type)
-        
-        # Get correlation ID (prefer request_id over others)
-        correlation_id = None
-        request_id = None
-        for cid in correlation_ids:
-            if 'request' in cid.lower():
-                request_id = cid
-            if not correlation_id:
-                correlation_id = cid
-        
-        # Create error context
-        error_context = ErrorContext(
-            start_line=line_idx - len(context_lines) + 1,
-            end_line=line_idx,
-            lines=context_lines,
-            format_type=format_type,
-            correlation_ids=correlation_ids,
-            related_entries=[],
-            metadata={'format': format_type}
-        )
-        
-        # Get related entries from correlation tracker
-        if correlation_id:
-            error_context.related_entries = self.correlation_tracker.get_related_entries(correlation_id)
-        
-        return ErrorMatch(
-            pattern=pattern,
-            matched_text=regex_match.group(0),
-            line=line,
-            file_path=str(file_path),
-            line_number=line_idx + 1,
-            timestamp=self._extract_timestamp(line),
-            node=self._extract_node(file_path),
-            correlation_id=correlation_id,
-            request_id=request_id,
-            full_context=error_context,
-            stack_trace=stack_trace,
-            context_before=context_lines[:5] if len(context_lines) > 5 else context_lines,
-            context_after=[]
-        )
-    
-    def _extract_stack_trace(self, lines: List[str], format_type: str) -> Optional[List[str]]:
-        """Extract stack trace from context lines"""
-        stack_trace = []
-        
-        if format_type in ['python_stack', 'java_stack', 'go_stack', 'ruby']:
-            in_stack = False
-            for line in lines:
-                if 'Traceback' in line or 'Exception' in line or 'panic:' in line:
-                    in_stack = True
-                    stack_trace.append(line.strip())
-                elif in_stack:
-                    if re.match(r'^\s+', line) or 'Caused by' in line:
-                        stack_trace.append(line.strip())
-                    elif line.strip() and not re.match(r'^\s', line):
-                        break
-        
-        return stack_trace if stack_trace else None
-    
-    def _extract_additional_fields(self, error_match: ErrorMatch):
-        """Extract additional fields from error context"""
-        if not error_match.full_context:
-            return
-        
-        for line in error_match.full_context.lines:
-            # Try JSON extraction
-            if line.strip().startswith('{'):
-                try:
-                    data = json.loads(line)
-                    error_match.user_id = error_match.user_id or data.get('user_id') or data.get('user')
-                    error_match.project_id = error_match.project_id or data.get('project_id') or data.get('project')
-                    error_match.duration_ms = error_match.duration_ms or data.get('duration_ms') or data.get('duration')
-                    
-                    # Extract error code
-                    if not error_match.error_code:
-                        error_match.error_code = (data.get('status') or 
-                                                 data.get('code') or 
-                                                 data.get('status_code') or
-                                                 data.get('grpc.code'))
-                except:
-                    pass
-            
-            # Extract HTTP status codes
-            if not error_match.error_code:
-                if match := re.search(r'\b([45]\d{2})\s+(?:Error|Bad|Not)', line):
-                    error_match.error_code = match.group(1)
-                elif match := re.search(r'status[:\s]+(\d{3})', line, re.IGNORECASE):
-                    error_match.error_code = match.group(1)
-    
-    def _should_process_line(self, line: str, file_path: Path = None) -> bool:
-        """Quick pre-filter to skip obviously non-error lines with false positive detection"""
-        if len(line) < 10:
-            return False
-        
-        # Check if it's a false positive pattern first
-        for fp_pattern in self.false_positive_filter.compiled_false_positive_patterns:
-            if fp_pattern.search(line):
-                return False
-        
-        # Check if it's just a worker class name
-        if self.false_positive_filter.is_worker_class_name(line):
-            return False
-        
-        # Check if it's a normal shutdown
-        if self.false_positive_filter.is_normal_shutdown(line):
-            return False
-        
-        # Skip successful operations unless they have critical errors
-        if any(success in line.lower() for success in [
-            '"level":"info"', '"level":"debug"', 
-            '"severity":"info"', '"severity":"debug"',
-            'success', 'succeeded', 'completed successfully'
-        ]):
-            if not any(critical in line.lower() for critical in [
-                'oom', 'panic', 'crashed', 'no space left'
-            ]):
-                return False
-        
-        # Quick checks for error indicators
-        error_indicators = {
-            'error', 'fail', 'fatal', 'panic', 'exception', 
-            'critical', 'timeout', 'refused', 'unavailable',
-            'abort', 'crash', 'corrupt', 'invalid', 'violation'
-        }
-        line_lower = line.lower()
-        
-        return any(indicator in line_lower for indicator in error_indicators)
-    
-    def _validate_match(self, line: str, matched_text: str, file_path: Path) -> bool:
-        """Validate if the match is a real error"""
-        
-        # Skip health endpoints even with HTTP errors
-        if any(endpoint in line for endpoint in ['/health', '/metrics', '/-/readiness', '/-/liveness', '/api/v4/internal/check']):
-            return False
-        
-        # Skip deprecation warnings
-        if 'future versions' in line or 'deprecated' in line:
-            return False
-        
-        # Check if it's diagnostic output describing errors
-        if self.false_positive_filter.is_diagnostic_output(file_path):
-            if any(desc in line for desc in ['Checking ', 'checks if', 'confirms if', 'verifies']):
-                return False
-        
-        return True
-    
-    def _extract_timestamp(self, line: str) -> Optional[datetime]:
-        """Extract timestamp from log line"""
-        patterns = [
-            r'(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})',
-            r'"time":"([^"]+)"',
-            r'"timestamp":"([^"]+)"',
-            r'"@timestamp":"([^"]+)"',
-            r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\]]*)\]',
-        ]
-        
-        for pattern in patterns:
-            if match := re.search(pattern, line):
-                try:
-                    timestamp_str = match.group(1).replace('T', ' ').split('.')[0].split('+')[0].split('Z')[0]
-                    return datetime.fromisoformat(timestamp_str)
-                except:
-                    pass
-        return None
-    
-    def _extract_node(self, file_path: Path) -> str:
-        """Extract node name from file path"""
-        path_str = str(file_path).lower()
-        
-        # Try to extract from path
-        if 'praefect' in path_str:
-            return 'praefect'
-        elif 'gitaly' in path_str:
-            return 'gitaly'
-        elif 'postgresql' in path_str or 'postgres' in path_str:
-            return 'postgresql'
-        elif 'redis' in path_str:
-            return 'redis'
-        elif 'sidekiq' in path_str:
-            return 'sidekiq'
-        elif 'workhorse' in path_str:
-            return 'workhorse'
-        elif 'nginx' in path_str:
-            return 'nginx'
-        elif 'gitlab' in path_str:
-            return 'gitlab'
-        
-        return 'unknown'
 
 
 class FalsePositiveFilter:
@@ -821,18 +465,6 @@ class FalsePositiveFilter:
             r'/bin/.*--.*timeout',
             r'/usr/bin/.*--.*error',
             
-            # Process listings showing commands
-            r'^\s*\d+\s+.*ruby.*sidekiq.*--timeout',
-            r'^\s*git\s+\d+.*ruby.*timeout',
-            r'/opt/gitlab/.*--timeout',
-            
-            # Thread/Stack traces showing gem paths (not errors)
-            r'Thread:.*gems.*rack-timeout',
-            r'<Thread:.*rack-timeout.*>',
-            r'/gems/.*timeout.*\.rb',
-            r'/gems/.*error.*\.rb',
-            r'/lib/ruby/.*timeout',
-            
             # Health check endpoints
             r'GET\s+/health',
             r'GET\s+/metrics',
@@ -840,26 +472,6 @@ class FalsePositiveFilter:
             r'GET\s+/-/readiness',
             r'GET\s+/-/liveness',
             r'POST\s+/api/v4/internal/check',
-            
-            # Check output descriptions
-            r'Checking\s+.*\s+\[(?:fatal|error|warning)\]',
-            r'checks if.*\[(?:fatal|error|warning)\]',
-            r'confirms if.*\[(?:fatal|error|warning)\]',
-            r'verifies if.*error',
-            r'Testing.*failed',
-            
-            # Normal job/worker execution
-            r'"jid":"[^"]+","class":"[^"]*Worker".*"status":"completed"',
-            r'"worker":"[^"]*Worker".*"duration":\d+',
-            r'"class":"[^"]*Worker".*"completed_at"',
-            r'"class":"[^"]*Worker".*INFO',
-            
-            # GitLab normal operations
-            r'gitlab-ctl\s+stop',
-            r'gitlab-ctl\s+restart',
-            r'gitlab-ctl\s+reconfigure',
-            r'Reconfigured successfully',
-            r'Upgrade complete',
             
             # Normal shutdown messages
             r'Shutting down gracefully',
@@ -873,127 +485,28 @@ class FalsePositiveFilter:
             r'deprecated.*will be removed',
             r'DEPRECATION WARNING',
             r'is deprecated and will',
-            
-            # Performance metrics (not errors)
-            r'"redis_calls":\d+,"redis_duration_s"',
-            r'"redis_read_bytes":\d+,"redis_write_bytes"',
-            r'"db_count":\d+,"db_duration_s"',
-            r'"cpu_s":\d+\.\d+,"mem_objects"',
-            
-            # Normal git operations
-            r'git-upload-pack.*exit.*status.*0',
-            r'git-receive-pack.*exit.*status.*0',
-            r'Counting objects',
-            r'Compressing objects',
-            r'Writing objects',
-            
-            # Prometheus scraping (normal)
-            r'msg="Scrape.*succeeded"',
-            r'scrape_duration_seconds',
-            r'scrape_samples_scraped',
-            
-            # Normal Redis operations
-            r'redis.*PING.*PONG',
-            r'redis.*Connected to Redis',
-            r'redis.*Reconnected to Redis'
         ]
         
         # Compile all patterns for efficiency
         self.compiled_worker_patterns = [re.compile(p, re.IGNORECASE) for p in self.worker_class_patterns]
         self.compiled_false_positive_patterns = [re.compile(p, re.IGNORECASE) for p in self.false_positive_patterns]
     
-    def is_monitoring_service_error(self, line: str, file_path: str) -> Tuple[bool, Optional[str]]:
-        """Check if error is from monitoring infrastructure not core GitLab"""
-        line_lower = line.lower()
-        
-        for service in self.monitoring_services:
-            if service in line_lower:
-                if f'{service}:' in line_lower or f'caller={service}' in line or f'agent={service}' in line:
-                    return True, service
-                if any(mon_url in line for mon_url in ['mimir.', 'loki.', 'tempo.', 'prometheus.', 'grafana.']):
-                    return True, service
-        
-        monitoring_indicators = [
-            'failed pushing to ingester',
-            'Failed to send batch',
-            'Failed to scrape',
-            'Exporting failed',
-            'non-recoverable error.*push',
-            'server returned HTTP status.*mimir',
-            'server returned HTTP status.*prometheus',
-            'ts=.*caller=dedupe.go'
-        ]
-        
-        for indicator in monitoring_indicators:
-            if re.search(indicator, line, re.IGNORECASE):
-                return True, 'monitoring'
-        
-        return False, None
-    
-    def is_worker_class_name(self, line: str) -> bool:
-        """Check if the match is just a worker class name, not an actual error"""
-        for pattern in self.compiled_worker_patterns:
-            if pattern.search(line):
-                error_indicators = [
-                    '"severity":"ERROR"',
-                    '"level":"error"',
-                    'failed permanently',
-                    'exhausted',
-                    'crashed',
-                    'exception":"',
-                    'error":"'
-                ]
-                
-                if not any(indicator in line for indicator in error_indicators):
-                    return True
-                
-                success_indicators = [
-                    '"status":"completed"',
-                    '"severity":"INFO"',
-                    '"level":"info"',
-                    'completed_at"',
-                    'succeeded_at"',
-                    '"duration_ms":',
-                    'enqueued_at"'
-                ]
-                
-                if any(indicator in line for indicator in success_indicators):
-                    return True
-        
-        return False
-    
-    def is_normal_shutdown(self, line: str) -> bool:
-        """Check if this is a normal shutdown operation"""
-        shutdown_patterns = [
-            r'terminating connection due to administrator command',
-            r'Received TERM signal',
-            r'Shutting down gracefully',
-            r'Graceful shutdown',
-            r'gitlab-ctl stop',
-            r'gitlab-ctl restart',
-            r'Stopping workers',
-            r'terminate.*administrator.*gitlab-ctl',
-            r'the database system is shutting down.*administrator',
-            r'process already finished',
-            r'waiting for supervised command',
-            r'wrapper for process shutting down'
-        ]
-        
-        for pattern in shutdown_patterns:
-            if re.search(pattern, line, re.IGNORECASE):
+    def is_false_positive(self, line: str, file_path: Path = None) -> bool:
+        """Check if a line is a false positive"""
+        # Check false positive patterns
+        for fp_pattern in self.compiled_false_positive_patterns:
+            if fp_pattern.search(line):
                 return True
         
-        if 'administrator command' in line and any(cmd in line for cmd in ['gitlab-ctl', 'systemctl', 'service']):
-            return True
-        
-        return False
-    
-    def is_diagnostic_output(self, file_path: Path) -> bool:
-        """Check if file contains diagnostic tool output with descriptions"""
-        filename = file_path.name.lower()
-        for diag_file in self.diagnostic_files:
-            if diag_file.lower() in filename:
+        # Check worker class names
+        for worker_pattern in self.compiled_worker_patterns:
+            if worker_pattern.search(line):
+                # Check if it's a real error despite having Worker in name
+                if '"severity":"ERROR"' in line or '"level":"error"' in line:
+                    if '"exception":"' in line or 'error":"' in line:
+                        return False  # Real error
                 return True
+        
         return False
     
     def is_schema_file(self, file_path: Path) -> bool:
@@ -1004,23 +517,10 @@ class FalsePositiveFilter:
             if schema_indicator.lower() in filename:
                 return True
         
-        if filename.endswith(('.sql', '.rb')):
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    first_lines = ''.join(f.readlines(100))
-                    if any(indicator in first_lines for indicator in [
-                        'CREATE TABLE', 'ALTER TABLE', 'add_column',
-                        't.integer', 't.string', 't.index',
-                        'ActiveRecord::Schema', 'create_table'
-                    ]):
-                        return True
-            except:
-                pass
-        
         return False
     
     def is_system_info_file(self, file_path: Path) -> bool:
-        """Check if file is a system info file (not a log)"""
+        """Check if file is a system info file"""
         filename = file_path.name
         
         if filename in self.system_info_files:
@@ -1043,10 +543,518 @@ class FalsePositiveFilter:
             return True
         
         return False
+    
+    def is_monitoring_service_error(self, line: str, file_path: str) -> Tuple[bool, Optional[str]]:
+        """Check if error is from monitoring infrastructure"""
+        line_lower = line.lower()
+        
+        for service in self.monitoring_services:
+            if service in line_lower:
+                if f'{service}:' in line_lower or f'caller={service}' in line or f'agent={service}' in line:
+                    return True, service
+        
+        return False, None
 
 
-class PatternBank:
-    """Central repository of ALL GitLab error patterns - COMPLETE SET with enhanced patterns"""
+class TurboStreamProcessor:
+    """Ultra-fast streaming processor with Aho-Corasick pre-filtering"""
+    
+    def __init__(self, pattern_bank: 'EnhancedPatternBank', false_positive_filter: FalsePositiveFilter = None):
+        self.pattern_bank = pattern_bank
+        self.false_positive_filter = false_positive_filter or FalsePositiveFilter()
+        self.boundary_detector = LogBoundaryDetector()
+        self.correlation_tracker = CorrelationTracker()
+        self.automaton = pattern_bank.automaton if HAS_AHOCORASICK else None
+        self.quick_filters = self._build_quick_filters()
+    
+    def _build_quick_filters(self) -> Set[str]:
+        """Build set of quick filter strings for pre-checking"""
+        filters = set()
+        # Extract key error indicators from patterns
+        for pattern in self.pattern_bank.patterns:
+            # Extract simple strings from regex patterns
+            simple_strings = re.findall(r'[a-z]+', pattern.pattern.lower())
+            filters.update(s for s in simple_strings if len(s) > 3)
+        # Add common error indicators
+        filters.update(['error', 'fail', 'fatal', 'panic', 'exception', 
+                       'critical', 'timeout', 'refused', 'unavailable',
+                       'abort', 'crash', 'corrupt', 'invalid', 'violation'])
+        return filters
+    
+    async def process_file_streaming(self, file_path: Path, result_queue: AsyncQueue) -> int:
+        """Process file with streaming results"""
+        errors_found = 0
+        
+        # Skip false positive files
+        if self.false_positive_filter.is_schema_file(file_path):
+            return 0
+        if self.false_positive_filter.is_system_info_file(file_path):
+            return 0
+        if self.false_positive_filter.is_config_file(file_path):
+            return 0
+        
+        try:
+            # Check file size for strategy selection
+            file_size = file_path.stat().st_size
+            use_mmap = file_size > 50 * 1024 * 1024 and not str(file_path).endswith('.gz')
+            
+            if use_mmap:
+                errors_found = await self._process_mmap(file_path, result_queue)
+            else:
+                errors_found = await self._process_regular(file_path, result_queue)
+                
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+        
+        return errors_found
+    
+    async def _process_regular(self, file_path: Path, result_queue: AsyncQueue) -> int:
+        """Regular file processing with streaming and context preservation"""
+        errors_found = 0
+        
+        # Get relevant patterns for this file type
+        relevant_patterns = self._get_relevant_patterns(file_path)
+        
+        # Load file into memory for context extraction
+        try:
+            if str(file_path).endswith('.gz'):
+                with gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+            else:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+        except Exception as e:
+            print(f"Failed to read {file_path}: {e}")
+            return 0
+        
+        # First pass: Build correlation index
+        for idx, line in enumerate(lines):
+            self.correlation_tracker.extract_ids(line, idx, str(file_path))
+        
+        # Second pass: Process errors with context
+        line_buffer = deque(maxlen=10)  # Keep last 10 lines for context
+        processed_lines = set()  # Track processed lines to avoid duplicates
+        
+        for line_number, line in enumerate(lines):
+            # Skip if already processed as part of another error's context
+            if line_number in processed_lines:
+                line_buffer.append(line.rstrip())
+                continue
+            
+            # Quick pre-filter
+            if not self._quick_check(line):
+                line_buffer.append(line.rstrip())
+                continue
+            
+            # Check for false positives
+            if self.false_positive_filter.is_false_positive(line, file_path):
+                line_buffer.append(line.rstrip())
+                continue
+            
+            # Check patterns
+            for pattern in relevant_patterns:
+                if pattern.id in self.pattern_bank.compiled_patterns:
+                    regex = self.pattern_bank.compiled_patterns[pattern.id]
+                    match = regex.search(line)
+                    
+                    if match:
+                        # Find error boundaries for full context
+                        start, end, format_type = self.boundary_detector.find_boundaries(lines, line_number)
+                        
+                        # Mark these lines as processed
+                        for i in range(start, end + 1):
+                            processed_lines.add(i)
+                        
+                        # Extract full context
+                        context_lines = lines[start:end+1]
+                        full_context = ''.join(context_lines)
+                        
+                        # Extract clean message
+                        clean_message = self._extract_clean_message(line, pattern, context_lines)
+                        
+                        # Create enhanced match
+                        error_match = EnhancedErrorMatch(
+                            pattern=pattern,
+                            matched_text=match.group(0),
+                            clean_message=clean_message,
+                            full_line=line.rstrip(),
+                            file_path=str(file_path),
+                            line_number=line_number + 1,
+                            context_before=list(line_buffer)[-5:] if line_buffer else [],
+                            context_after=[lines[i].rstrip() for i in range(line_number + 1, min(line_number + 6, len(lines)))],
+                            full_context_text=full_context,
+                            node=self._extract_node(file_path),
+                            timestamp=self._extract_timestamp(line)
+                        )
+                        
+                        # Extract additional metadata
+                        self._extract_metadata(line, error_match, context_lines)
+                        
+                        # Extract stack trace if present
+                        if format_type in ['python_stack', 'java_stack', 'go_stack', 'ruby']:
+                            error_match.stack_trace = self._extract_stack_trace(context_lines, format_type)
+                        
+                        # Get correlation info
+                        if error_match.correlation_id:
+                            related = self.correlation_tracker.get_related_entries(error_match.correlation_id)
+                            error_match.json_fields['related_entries_count'] = len(related)
+                        
+                        # Send to result queue
+                        await result_queue.put({
+                            'type': 'error',
+                            'data': error_match.to_dict()
+                        })
+                        
+                        errors_found += 1
+                        break  # Move to next line after finding a match
+            
+            line_buffer.append(line.rstrip())
+            
+            # Progress update every 1000 lines
+            if line_number > 0 and line_number % 1000 == 0:
+                await result_queue.put({
+                    'type': 'progress',
+                    'file': str(file_path),
+                    'lines_processed': line_number,
+                    'total_lines': len(lines),
+                    'progress_percent': (line_number / len(lines)) * 100
+                })
+        
+        return errors_found
+    
+    async def _process_mmap(self, file_path: Path, result_queue: AsyncQueue) -> int:
+        """Memory-mapped file processing for huge files"""
+        errors_found = 0
+        relevant_patterns = self._get_relevant_patterns(file_path)
+        
+        with open(file_path, 'r+b') as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
+                # Process in chunks
+                chunk_size = 10 * 1024 * 1024  # 10MB chunks
+                offset = 0
+                line_buffer = deque(maxlen=10)
+                
+                while offset < len(mmapped_file):
+                    # Read chunk
+                    end_offset = min(offset + chunk_size, len(mmapped_file))
+                    
+                    # Find line boundary
+                    while end_offset < len(mmapped_file) and mmapped_file[end_offset-1:end_offset] != b'\n':
+                        end_offset += 1
+                    
+                    chunk = mmapped_file[offset:end_offset].decode('utf-8', errors='ignore')
+                    lines = chunk.split('\n')
+                    
+                    for line in lines:
+                        if not line:
+                            continue
+                        
+                        if self._quick_check(line) and not self.false_positive_filter.is_false_positive(line):
+                            for pattern in relevant_patterns:
+                                if pattern.id in self.pattern_bank.compiled_patterns:
+                                    regex = self.pattern_bank.compiled_patterns[pattern.id]
+                                    match = regex.search(line)
+                                    
+                                    if match:
+                                        clean_message = self._extract_clean_message(line, pattern)
+                                        
+                                        error_match = EnhancedErrorMatch(
+                                            pattern=pattern,
+                                            matched_text=match.group(0),
+                                            clean_message=clean_message,
+                                            full_line=line,
+                                            file_path=str(file_path),
+                                            line_number=0,  # Line numbers not available with mmap
+                                            context_before=list(line_buffer)[-5:],
+                                            node=self._extract_node(file_path),
+                                            timestamp=self._extract_timestamp(line)
+                                        )
+                                        
+                                        self._extract_metadata(line, error_match)
+                                        
+                                        await result_queue.put({
+                                            'type': 'error',
+                                            'data': error_match.to_dict()
+                                        })
+                                        
+                                        errors_found += 1
+                                        break
+                        
+                        line_buffer.append(line)
+                    
+                    offset = end_offset
+                    
+                    # Progress update
+                    await result_queue.put({
+                        'type': 'progress',
+                        'file': str(file_path),
+                        'progress_percent': (offset / len(mmapped_file)) * 100
+                    })
+        
+        return errors_found
+    
+    def _quick_check(self, line: str) -> bool:
+        """Ultra-fast pre-check using Aho-Corasick or simple string matching"""
+        if not line or len(line) < 10:
+            return False
+        
+        line_lower = line.lower()
+        
+        # Use Aho-Corasick if available
+        if self.automaton and HAS_AHOCORASICK:
+            try:
+                for end_index, pattern in self.automaton.iter(line_lower):
+                    return True
+                return False
+            except:
+                pass
+        
+        # Fallback to quick string checks
+        return any(indicator in line_lower for indicator in self.quick_filters)
+    
+    def _extract_clean_message(self, line: str, pattern: ErrorPattern, context_lines: List[str] = None) -> str:
+        """Extract clean, human-readable error message"""
+        
+        # Try JSON extraction first
+        if line.strip().startswith('{'):
+            try:
+                data = json.loads(line)
+                
+                # For exception.class, try to get the full message
+                exception_class = data.get('exception.class') or data.get('exception', {}).get('class')
+                exception_message = data.get('exception.message') or data.get('exception', {}).get('message')
+                
+                # Combine class and message if both exist
+                if exception_class and exception_message:
+                    return f"{exception_class}: {exception_message}"
+                
+                # Priority order for message extraction
+                message = (
+                    exception_message or
+                    data.get('error_message') or
+                    exception_class or
+                    data.get('error') or
+                    data.get('msg') or
+                    data.get('message', '')
+                )
+                
+                # Clean up common noise
+                if message and message not in ['bulk_exception', 'exception', 'error']:
+                    return message
+                    
+            except json.JSONDecodeError:
+                pass
+        
+        # Check context lines for better message
+        if context_lines:
+            for ctx_line in context_lines[:5]:  # Check first 5 lines
+                if ctx_line.strip().startswith('{'):
+                    try:
+                        data = json.loads(ctx_line)
+                        message = (
+                            data.get('error_message') or
+                            data.get('exception', {}).get('message') or
+                            data.get('error')
+                        )
+                        if message and message not in ['bulk_exception', 'exception', 'error']:
+                            return message
+                    except:
+                        pass
+        
+        # Pattern-specific extraction
+        extractors = {
+            'ssl': r'(?:error|failed):\s*(.+?)(?:\n|$)',
+            'timeout': r'timeout.*?:\s*(.+?)(?:\n|$)',
+            'connection': r'connection.*?:\s*(.+?)(?:\n|$)',
+            'postgres': r'ERROR:\s*(.+?)(?:\n|$)',
+            'grpc': r'desc\s*=\s*"?([^"]+)"?',
+            'redis': r'(?:Redis|REDIS).*?:\s*(.+?)(?:\n|$)',
+            'sidekiq': r'(?:failed|error):\s*(.+?)(?:\n|$)',
+        }
+        
+        for key, extractor in extractors.items():
+            if key in pattern.id.lower() or key in pattern.component.lower():
+                match = re.search(extractor, line, re.IGNORECASE)
+                if match:
+                    return match.group(1).strip()
+        
+        # Generic extraction
+        error_patterns = [
+            r'(?:ERROR|FATAL|CRITICAL|error|fail)[:\s]+(.+?)(?:\n|$)',
+            r'message[:\s]+["\']*([^"\']+)',
+            r'msg[:\s]+["\']*([^"\']+)',
+        ]
+        
+        for error_pattern in error_patterns:
+            match = re.search(error_pattern, line, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        
+        # Fallback to pattern description
+        return pattern.description or pattern.pattern[:100]
+    
+    def _extract_metadata(self, line: str, error_match: EnhancedErrorMatch, context_lines: List[str] = None):
+        """Extract all available metadata"""
+        
+        # JSON extraction
+        if line.strip().startswith('{'):
+            try:
+                data = json.loads(line)
+                error_match.json_fields = data
+                
+                # Extract specific fields
+                error_match.correlation_id = data.get('correlation_id')
+                error_match.request_id = data.get('request_id')
+                error_match.user_id = data.get('user_id')
+                error_match.project_id = data.get('project_id')
+                error_match.job_id = data.get('job_id')
+                error_match.trace_id = data.get('trace_id')
+                error_match.error_code = data.get('code') or data.get('status') or data.get('grpc.code')
+                
+            except json.JSONDecodeError:
+                pass
+        
+        # Pattern-based extraction
+        patterns = {
+            'correlation_id': r'correlation_id[=:]\s*"?([a-zA-Z0-9\-_]+)"?',
+            'request_id': r'request_id[=:]\s*"?([a-zA-Z0-9\-_]+)"?',
+            'status_code': r'\b([45]\d{2})\s+(?:Error|Bad|Not)',
+            'grpc_code': r'code\s*=\s*(\w+)',
+        }
+        
+        for field, regex in patterns.items():
+            if match := re.search(regex, line, re.IGNORECASE):
+                if field == 'status_code':
+                    error_match.error_code = match.group(1)
+                else:
+                    setattr(error_match, field, match.group(1))
+        
+        # Check context lines for additional metadata
+        if context_lines:
+            for ctx_line in context_lines:
+                if not error_match.correlation_id:
+                    if match := re.search(r'correlation_id[=:]\s*"?([a-zA-Z0-9\-_]+)"?', ctx_line):
+                        error_match.correlation_id = match.group(1)
+                if not error_match.error_code:
+                    if match := re.search(r'\b([45]\d{2})\s+', ctx_line):
+                        error_match.error_code = match.group(1)
+    
+    def _extract_stack_trace(self, lines: List[str], format_type: str) -> Optional[List[str]]:
+        """Extract stack trace from context lines"""
+        stack_trace = []
+        
+        if format_type == 'python_stack':
+            in_trace = False
+            for line in lines:
+                if 'Traceback' in line:
+                    in_trace = True
+                    stack_trace.append(line.strip())
+                elif in_trace:
+                    if line.startswith(' ') or 'File' in line:
+                        stack_trace.append(line.strip())
+                    else:
+                        break
+        
+        elif format_type == 'java_stack':
+            for line in lines:
+                if 'Exception' in line or line.strip().startswith('at '):
+                    stack_trace.append(line.strip())
+                elif 'Caused by:' in line:
+                    stack_trace.append(line.strip())
+        
+        elif format_type == 'go_stack':
+            for line in lines:
+                if 'panic:' in line or 'goroutine' in line or '.go:' in line:
+                    stack_trace.append(line.strip())
+        
+        return stack_trace if stack_trace else None
+    
+    def _get_relevant_patterns(self, file_path: Path) -> List[ErrorPattern]:
+        """Get patterns relevant to this file type, sorted by priority"""
+        
+        path_str = str(file_path).lower()
+        filename = file_path.name.lower()
+        
+        # Map file types to relevant components
+        relevance_map = {
+            'sidekiq': ['Sidekiq', 'Rails', 'Redis'],
+            'gitaly': ['Praefect/Gitaly', 'Git/Shell'],
+            'praefect': ['Praefect/Gitaly'],
+            'postgresql': ['PostgreSQL'],
+            'postgres': ['PostgreSQL'],
+            'redis': ['Redis'],
+            'nginx': ['Nginx', 'Network'],
+            'workhorse': ['Workhorse', 'Rails', 'Network'],
+            'gitlab-rails': ['Rails', 'Auth', 'Geo'],
+            'puma': ['Puma/Workhorse', 'Rails'],
+            'production': ['Rails'],
+            'api_json': ['Rails'],
+            'application': ['Rails'],
+        }
+        
+        # Determine relevant components
+        relevant_components = set()
+        for key, components in relevance_map.items():
+            if key in path_str or key in filename:
+                relevant_components.update(components)
+        
+        # Add generic components
+        relevant_components.update(['System/OS', 'Network', 'Generic'])
+        
+        # Filter patterns by relevance
+        relevant = []
+        for p in self.pattern_bank.patterns:
+            if p.component in relevant_components:
+                relevant.append(p)
+            elif p.severity == 'CRITICAL':
+                relevant.append(p)  # Always include critical patterns
+        
+        # Sort by priority and severity
+        severity_order = {'CRITICAL': 0, 'ERROR': 1, 'WARNING': 2}
+        relevant.sort(key=lambda p: (
+            -p.priority,  # Higher priority first
+            severity_order.get(p.severity, 3),  # Critical first
+            p.id  # Alphabetical as tiebreaker
+        ))
+        
+        return relevant
+    
+    def _extract_timestamp(self, line: str) -> Optional[datetime]:
+        """Extract timestamp from log line"""
+        patterns = [
+            r'(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})',
+            r'"time":"([^"]+)"',
+            r'"timestamp":"([^"]+)"',
+            r'"@timestamp":"([^"]+)"',
+            r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\]]*)\]',
+        ]
+        
+        for pattern in patterns:
+            if match := re.search(pattern, line):
+                try:
+                    timestamp_str = match.group(1).replace('T', ' ').split('.')[0].split('+')[0].split('Z')[0]
+                    return datetime.fromisoformat(timestamp_str)
+                except:
+                    pass
+        return None
+    
+    def _extract_node(self, file_path: Path) -> str:
+        """Extract node name from file path"""
+        path_str = str(file_path).lower()
+        
+        nodes = ['praefect', 'gitaly', 'postgresql', 'postgres', 'redis', 
+                 'sidekiq', 'workhorse', 'nginx', 'puma', 'gitlab-rails',
+                 'gitlab-shell', 'registry', 'pages', 'kas']
+        
+        for node in nodes:
+            if node in path_str:
+                return node
+        
+        return 'unknown'
+
+
+class EnhancedPatternBank:
+    """Complete pattern bank with all GitLab error patterns"""
     
     def __init__(self):
         self.patterns: List[ErrorPattern] = []
@@ -1801,20 +1809,17 @@ class PatternBank:
             ErrorPattern('uncaught_exception', r'uncaught\s+exception', 'Generic', 'generic', 'ERROR', multiline=True),
         ]
         
-        # Add all patterns to the bank
+        # Combine all patterns
         all_patterns = (
-            praefect_patterns + postgresql_patterns + redis_patterns + 
+            praefect_patterns + postgresql_patterns + redis_patterns +
             sidekiq_patterns + rails_patterns + kubernetes_patterns +
             ssl_patterns + geo_patterns + other_patterns
         )
         
-        for pattern in all_patterns:
-            self.patterns.append(pattern)
-            self.by_component[pattern.component].append(pattern)
-            self.by_severity[pattern.severity].append(pattern)
-    
+        self.patterns.extend(all_patterns)
+        
     def _compile_patterns(self):
-        """Compile all regex patterns for efficient matching"""
+        """Compile patterns with caching"""
         for pattern in self.patterns:
             try:
                 self.compiled_patterns[pattern.id] = re2.compile(
@@ -1822,579 +1827,248 @@ class PatternBank:
                     re2.IGNORECASE | re2.MULTILINE
                 )
             except Exception as e:
-                print(f"⚠️  Failed to compile pattern {pattern.id}: {e}")
+                print(f"Failed to compile pattern {pattern.id}: {e}")
     
     def _build_automaton(self):
         """Build Aho-Corasick automaton for ultra-fast multi-pattern matching"""
         if not HAS_AHOCORASICK:
             return
-        
         self.automaton = pyahocorasick.Automaton()
         
-        # Add simple string patterns to automaton
         for pattern in self.patterns:
-            # Extract literal strings from regex for fast pre-filtering
+            # Extract literal strings from regex
             literals = self._extract_literals(pattern.pattern)
             for literal in literals:
                 self.automaton.add_word(literal.lower(), pattern)
         
         self.automaton.make_automaton()
-        if mp.current_process().name == 'MainProcess':
-            print(f"✅ Built Aho-Corasick automaton with {len(self.automaton)} patterns")
+        print(f"✅ Built Aho-Corasick automaton with {len(self.automaton)} patterns")
     
     def _extract_literals(self, regex_pattern: str) -> List[str]:
-        """Extract literal strings from regex pattern for Aho-Corasick"""
+        """Extract literal strings from regex for Aho-Corasick"""
         literals = []
         
-        # Enhanced literal extraction
-        simple_patterns = [
-            'error', 'fail', 'fatal', 'panic', 'critical',
-            'timeout', 'refused', 'unavailable', 'exception',
-            'crash', 'abort', 'invalid', 'violation', 'corrupt',
-            'deadline', 'exceeded', 'exhausted', 'denied'
-        ]
+        # Remove regex special chars to get literals
+        cleaned = re.sub(r'[\\^$*+?{}\[\]().|]', ' ', regex_pattern)
+        words = cleaned.split()
         
-        pattern_lower = regex_pattern.lower()
-        for literal in simple_patterns:
-            if literal in pattern_lower:
-                literals.append(literal)
+        # Filter meaningful words (>3 chars)
+        literals = [w.lower() for w in words if len(w) > 3]
         
-        # Also extract component-specific literals
-        if 'praefect' in pattern_lower:
-            literals.append('praefect')
-        if 'gitaly' in pattern_lower:
-            literals.append('gitaly')
-        if 'postgres' in pattern_lower or 'pg::' in pattern_lower:
-            literals.append('postgres')
-        if 'redis' in pattern_lower:
-            literals.append('redis')
-        if 'sidekiq' in pattern_lower:
-            literals.append('sidekiq')
-        
-        return literals if literals else [regex_pattern[:20].replace('\\', '').replace('.*', '')]
+        return literals if literals else [regex_pattern[:20]]
 
 
-class AutoGrep:
-    """Main analyzer class - Ultra-reliable GitLab error detection with enhanced context extraction"""
+class TurboAutoGrep:
+    """Main analyzer with streaming and parallel processing"""
     
     def __init__(self, workers: int = None):
-        self.workers = workers or min(mp.cpu_count(), 8)
-        self.pattern_bank = PatternBank()
-        self.false_positive_filter = FalsePositiveFilter()
-        self.results = defaultdict(list)
-        self.error_clusters = defaultdict(list)
-        self.monitoring_errors = defaultdict(list)
-        self.gitlab_errors = defaultdict(list)
-        self.monitoring_clusters = defaultdict(list)
-        self.correlation_index = defaultdict(list)  # New: track by correlation ID
+        self.workers = workers or min(mp.cpu_count(), 16)  # Use more cores
+        self.pattern_bank = EnhancedPatternBank()
+        self.results_queue = None
         self.stats = {
             'files_processed': 0,
             'lines_processed': 0,
             'errors_found': 0,
-            'gitlab_errors': 0,
-            'monitoring_errors': 0,
-            'false_positives_filtered': 0,
-            'correlation_groups': 0,
             'start_time': None,
             'end_time': None
         }
     
-    def analyze_tar(self, tar_path: str) -> Dict[str, Any]:
-        """Analyze GitLab SOS dump with enhanced context extraction"""
+    async def analyze_tar_streaming(self, tar_path: str, callback=None):
+        """Analyze with streaming results"""
         print(f"\n{'='*80}")
-        print(f"🚀 AUTOGREP ENHANCED - Starting analysis of {tar_path}")
+        print(f"🚀 TURBO AUTOGREP - Starting streaming analysis")
+        print(f"⚡ Using {self.workers} parallel workers")
         print(f"{'='*80}\n")
         
         self.stats['start_time'] = time.time()
+        self.results_queue = AsyncQueue()
         
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Extract tar
+            # Extract archive
             print("📦 Extracting archive...")
-            self._extract_tar(tar_path, temp_dir)
-            
-            # Find files to process
-            print("🔍 Scanning for log files...")
-            files = self._find_log_files(Path(temp_dir))
+            files = self._extract_tar(tar_path, temp_dir)
             print(f"📋 Found {len(files)} files to analyze")
             
-            # Process files in parallel with enhanced processor
-            print(f"⚡ Processing with {self.workers} workers (enhanced context extraction)...")
-            self._process_files_parallel(files)
+            # Start result collector
+            results = []
+            collector_task = asyncio.create_task(
+                self._collect_results(self.results_queue, results, callback)
+            )
             
-            # Cluster errors with correlation grouping
-            print("🔮 Clustering errors and correlating related entries...")
-            self._cluster_errors()
+            # Process files in parallel
+            print(f"⚡ Processing with {self.workers} workers...")
+            await self._process_files_parallel_async(files)
             
-            # Generate report
+            # Signal completion
+            await self.results_queue.put({'type': 'complete'})
+            
+            # Wait for collector
+            await collector_task
+            
             self.stats['end_time'] = time.time()
-            return self._generate_report()
+            
+            # Group and analyze results
+            analyzed_results = self._analyze_results(results)
+            
+            return analyzed_results
     
-    def _extract_tar(self, tar_path: str, dest: str):
-        """Extract archive file - handles tar, tar.gz, tgz, and zip files"""
-        import tarfile
-        import zipfile
+    async def _process_files_parallel_async(self, files: List[Path]):
+        """Process files in parallel with async/await"""
         
-        archive_name = os.path.basename(tar_path).lower()
-        
-        try:
-            if archive_name.endswith('.zip'):
-                print(f"  📦 Detected ZIP archive")
-                with zipfile.ZipFile(tar_path, 'r') as zf:
-                    zf.extractall(dest)
-                    
-            elif archive_name.endswith('.tar.gz') or archive_name.endswith('.tgz'):
-                print(f"  📦 Detected TAR.GZ archive")
-                with tarfile.open(tar_path, 'r:gz') as tar:
-                    tar.extractall(dest)
-                    
-            elif archive_name.endswith('.tar'):
-                print(f"  📦 Detected TAR archive")
-                with tarfile.open(tar_path, 'r') as tar:
-                    tar.extractall(dest)
-                    
-            else:
-                # Fallback: try to detect by magic bytes
-                print(f"  ⚠️  Unknown extension, detecting format...")
-                
-                with open(tar_path, 'rb') as f:
-                    magic = f.read(4)
-                
-                if magic[:2] == b'PK':
-                    print(f"  📦 Detected ZIP by magic bytes")
-                    with zipfile.ZipFile(tar_path, 'r') as zf:
-                        zf.extractall(dest)
-                        
-                elif magic[:3] == b'\x1f\x8b\x08':
-                    print(f"  📦 Detected GZIP by magic bytes")
-                    with tarfile.open(tar_path, 'r:gz') as tar:
-                        tar.extractall(dest)
-                        
-                else:
-                    print(f"  📦 Attempting TAR extraction")
-                    with tarfile.open(tar_path, 'r') as tar:
-                        tar.extractall(dest)
-                        
-            print(f"  ✅ Successfully extracted to {dest}")
-            
-        except Exception as e:
-            print(f"  ❌ Failed to extract {tar_path}: {e}")
-            raise Exception(f"Could not extract archive: {e}")
-    
-    def _find_log_files(self, root: Path) -> List[Path]:
-        """Find all relevant log files"""
-        files = []
-        
-        for path in root.rglob('*'):
-            if path.is_file():
-                # Include log files and specific system files
-                if any(indicator in str(path).lower() for indicator in [
-                    'log', 'current', 'production', 'sidekiq', 'gitaly',
-                    'praefect', 'workhorse', 'postgres', 'redis', 'nginx',
-                    'puma', 'unicorn', 'gitlab-rails', 'gitlab-shell'
-                ]):
-                    files.append(path)
-        
-        return files
-    
-    def _process_files_parallel(self, files: List[Path]):
-        """Process files in parallel with enhanced error categorization and context extraction"""
-        with ProcessPoolExecutor(max_workers=self.workers) as executor:
-            futures = {executor.submit(self._process_single_file, f): f for f in files}
-            
-            completed = 0
-            total = len(files)
-            
-            for future in as_completed(futures):
-                completed += 1
-                self.stats['files_processed'] += 1
-                print(f"\r⚡ Progress: {completed}/{total} files ({100*completed/total:.1f}%)", end='', flush=True)
-                
-                try:
-                    errors, lines_count = future.result()
-                    self.stats['lines_processed'] += lines_count
-                    
-                    for error in errors:
-                        self.results[error.pattern.component].append(error)
-                        self.stats['errors_found'] += 1
-                        
-                        # Track by correlation ID
-                        if error.correlation_id:
-                            self.correlation_index[error.correlation_id].append(error)
-                        
-                        # Separate monitoring from GitLab errors
-                        if error.metadata.get('error_type') == 'monitoring':
-                            self.monitoring_errors[error.pattern.component].append(error)
-                            self.stats['monitoring_errors'] += 1
-                        else:
-                            self.gitlab_errors[error.pattern.component].append(error)
-                            self.stats['gitlab_errors'] += 1
-                            
-                except Exception as e:
-                    print(f"\n⚠️  Error processing file: {e}")
-            
-            print()  # New line after progress
-    
-    def _process_single_file(self, file_path: Path) -> Tuple[List[ErrorMatch], int]:
-        """Process single file with enhanced context extraction"""
-        processor = EnhancedStreamProcessor(self.pattern_bank, self.false_positive_filter)
-        errors = []
-        
-        # Process file with enhanced context
-        for error_match in processor.process_file(file_path):
-            # Check if it's a monitoring error
-            if error_match.metadata.get('is_monitoring', False):
-                error_match.metadata['error_type'] = 'monitoring'
-            else:
-                error_match.metadata['error_type'] = 'gitlab'
-            
-            errors.append(error_match)
-        
-        lines_processed = processor.line_number
-        
-        return errors, lines_processed
-    
-    def _cluster_errors(self):
-        """Enhanced clustering with correlation awareness"""
-        # Cluster GitLab errors
-        for component, errors in self.gitlab_errors.items():
-            # Group by signature and correlation
-            clusters = defaultdict(list)
-            for error in errors:
-                # Create compound key including correlation
-                if error.correlation_id and len(self.correlation_index[error.correlation_id]) > 1:
-                    # This error is part of a correlation group
-                    cluster_key = f"{error.signature}_corr_{error.correlation_id}"
-                else:
-                    cluster_key = error.signature
-                    
-                clusters[cluster_key].append(error)
-            
-            # Sort clusters by frequency
-            sorted_clusters = sorted(
-                clusters.items(),
-                key=lambda x: len(x[1]),
-                reverse=True
-            )
-            
-            self.error_clusters[component] = sorted_clusters
-        
-        # Count correlation groups
-        self.stats['correlation_groups'] = len([
-            cid for cid, errors in self.correlation_index.items() 
-            if len(errors) > 1
-        ])
-        
-        # Also cluster monitoring errors separately
-        for component, errors in self.monitoring_errors.items():
-            clusters = defaultdict(list)
-            for error in errors:
-                clusters[error.signature].append(error)
-            
-            sorted_clusters = sorted(
-                clusters.items(),
-                key=lambda x: len(x[1]),
-                reverse=True
-            )
-            
-            self.monitoring_clusters[component] = sorted_clusters
-    
-    def _extract_error_message(self, error_match: ErrorMatch) -> str:
-        """Extract the actual error message from the enhanced error match"""
-        # Use the enhanced error message extraction
-        if error_match.error_message:
-            return error_match.error_message
-        
-        # Fallback to old method if needed
-        line = error_match.line
-        
-        # Try to parse JSON and extract meaningful message
-        if line.strip().startswith('{'):
-            try:
-                data = json.loads(line)
-                msg = (data.get('error') or 
-                       data.get('message') or 
-                       data.get('msg') or 
-                       data.get('error_message') or
-                       data.get('exception', {}).get('message'))
-                if msg:
-                    return msg
-            except:
-                pass
-        
-        # For non-JSON, extract error message using patterns
-        patterns = [
-            r'error[:\s]+([^,\n]+)',
-            r'failed[:\s]+([^,\n]+)',
-            r'message[:\s]+["\']*([^"\']+)',
-            r'msg[:\s]+["\']*([^"\']+)'
+        # Create processor pool
+        processors = [
+            TurboStreamProcessor(self.pattern_bank) 
+            for _ in range(self.workers)
         ]
         
-        for pattern in patterns:
-            match = re.search(pattern, line, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
+        # Create tasks
+        tasks = []
+        for i, file_path in enumerate(files):
+            processor = processors[i % self.workers]
+            task = processor.process_file_streaming(
+                file_path, 
+                self.results_queue
+            )
+            tasks.append(task)
         
-        return error_match.matched_text
+        # Run all tasks concurrently
+        results = await asyncio.gather(*tasks)
+        
+        self.stats['files_processed'] = len(files)
+        self.stats['errors_found'] = sum(results)
     
-    def _cluster_errors_by_message(self):
-        """Enhanced clustering that groups by actual error messages with correlation awareness"""
-        message_clusters = defaultdict(list)
-        
-        for component, errors in self.gitlab_errors.items():
-            for error in errors:
-                # Extract the actual error message
-                error_msg = self._extract_error_message(error)
+    async def _collect_results(self, queue: AsyncQueue, results: List, callback):
+        """Collect streaming results"""
+        while True:
+            try:
+                item = await queue.get()
                 
-                # Create a normalized key for clustering
-                cluster_key = re.sub(r'\b\d+\b', 'N', error_msg)
-                cluster_key = re.sub(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', 'UUID', cluster_key)
-                cluster_key = re.sub(r'\b0x[a-f0-9]+\b', 'HEX', cluster_key)
-                
-                # Add correlation info to key if present
-                if error.correlation_id:
-                    cluster_key = f"{component}:{cluster_key[:100]}_corr"
-                else:
-                    cluster_key = f"{component}:{cluster_key[:100]}"
-                
-                error.actual_message = error_msg
-                message_clusters[cluster_key].append(error)
-        
-        # Convert to sorted clusters
-        self.message_based_clusters = {}
-        for component in self.gitlab_errors.keys():
-            component_clusters = []
-            for cluster_key, errors in message_clusters.items():
-                if cluster_key.startswith(f"{component}:"):
-                    if errors:
-                        msg_counts = Counter(e.actual_message for e in errors)
-                        representative_msg = msg_counts.most_common(1)[0][0]
+                if item['type'] == 'complete':
+                    break
+                elif item['type'] == 'error':
+                    results.append(item['data'])
+                    self.stats['errors_found'] += 1
+                    
+                    # Stream to callback if provided
+                    if callback:
+                        result = callback(item['data'])
+                        if result and asyncio.iscoroutine(result):
+                            await result
                         
-                        # Check if this is a correlated error group
-                        correlation_ids = set(e.correlation_id for e in errors if e.correlation_id)
+                elif item['type'] == 'progress':
+                    # Handle progress updates
+                    if callback:
+                        result = callback({'type': 'progress', **item})
+                        if result and asyncio.iscoroutine(result):
+                            await result
                         
-                        component_clusters.append({
-                            'message': representative_msg,
-                            'errors': errors,
-                            'count': len(errors),
-                            'pattern': errors[0].pattern,
-                            'severity': errors[0].pattern.severity,
-                            'has_correlation': len(correlation_ids) > 0,
-                            'correlation_count': len(correlation_ids),
-                            'full_context_available': any(e.full_context for e in errors),
-                            'stack_traces': [e.stack_trace for e in errors if e.stack_trace]
-                        })
-            
-            component_clusters.sort(key=lambda x: x['count'], reverse=True)
-            self.message_based_clusters[component] = component_clusters
+            except Exception as e:
+                print(f"Collector error: {e}")
     
-    def _generate_report(self) -> Dict[str, Any]:
-        """Enhanced report generation with context-aware clustering"""
-        self._cluster_errors_by_message()
+    def _analyze_results(self, results: List[Dict]) -> Dict[str, Any]:
+        """Analyze and group results"""
         
-        duration = self.stats['end_time'] - self.stats['start_time']
+        print(f"🔍 Analyzing {len(results)} error results...")
         
-        print(f"\n{'='*80}")
-        print(f"📊 ANALYSIS COMPLETE (ENHANCED)")
-        print(f"{'='*80}\n")
+        # DEBUG: Print first result to see structure
+        if results:
+            print(f"📋 First result keys: {list(results[0].keys())}")
+            print(f"📋 First result sample: {results[0].get('message', 'NO MESSAGE')[:100]}")
         
-        print(f"⏱️  Duration: {duration:.2f} seconds")
-        print(f"📁 Files processed: {self.stats['files_processed']:,}")
-        print(f"📄 Lines processed: {self.stats['lines_processed']:,}")
-        print(f"❌ Total errors found: {self.stats['errors_found']:,}")
-        print(f"  ├─ GitLab errors: {self.stats['gitlab_errors']:,}")
-        print(f"  ├─ Monitoring errors: {self.stats['monitoring_errors']:,}")
-        print(f"  └─ Correlation groups: {self.stats['correlation_groups']:,}\n")
+        # Group by signature
+        error_groups = defaultdict(list)
         
-        # Build enhanced report data
-        report_data = {
-            'summary': {
-                **self.stats,
-                'duration_seconds': duration,
-                'enhanced_context': True
-            },
-            'error_messages': {},
-            'gitlab_components': {},
-            'monitoring_summary': {},
-            'correlation_groups': {}
+        for error in results:
+            # Create signature for grouping
+            sig = self._create_signature(error)
+            error_groups[sig].append(error)
+        
+        print(f"📊 Created {len(error_groups)} error groups from {len(results)} errors")
+        
+        # Build final report
+        report = {
+            'summary': self.stats,
+            'total_errors': len(results),
+            'unique_patterns': len(error_groups),
+            'errors_by_severity': self._group_by_severity(results),
+            'errors_by_component': self._group_by_component(results),
+            'error_groups': [],
+            'top_errors': []
         }
         
-        # Process message-based clusters with enhanced context
-        for component, clusters in self.message_based_clusters.items():
-            component_messages = []
-            component_patterns = []
-            
-            for cluster in clusters[:20]:  # Top 20 per component
-                # Enhanced message info
-                component_messages.append({
-                    'message': cluster['message'],
-                    'count': cluster['count'],
-                    'severity': cluster['severity'],
-                    'pattern_id': cluster['pattern'].id,
-                    'has_correlation': cluster['has_correlation'],
-                    'correlation_count': cluster['correlation_count'],
-                    'has_full_context': cluster['full_context_available'],
-                    'has_stack_trace': len(cluster['stack_traces']) > 0,
-                    'sample': cluster['errors'][0].line if cluster['errors'] else '',
-                    'files': list(set(os.path.basename(e.file_path) for e in cluster['errors'][:5])),
-                    'error_codes': list(set(e.error_code for e in cluster['errors'] if e.error_code))[:5]
-                })
-                
-                # Backward compatibility
-                component_patterns.append({
-                    'pattern_id': cluster['pattern'].id,
-                    'severity': cluster['severity'],
-                    'count': cluster['count'],
-                    'pattern': cluster['pattern'].pattern[:200],
-                    'description': cluster['message'],
-                    'sample': cluster['errors'][0].line if cluster['errors'] else '',
-                    'files': list(set(os.path.basename(e.file_path) for e in cluster['errors'][:5]))
-                })
-            
-            report_data['error_messages'][component] = component_messages
-            report_data['gitlab_components'][component] = component_patterns
-        
-        # Add correlation groups summary
-        correlation_summary = []
-        for correlation_id, errors in self.correlation_index.items():
-            if len(errors) > 1:
-                correlation_summary.append({
-                    'correlation_id': correlation_id,
-                    'error_count': len(errors),
-                    'components': list(set(e.pattern.component for e in errors)),
-                    'severities': list(set(e.pattern.severity for e in errors)),
-                    'time_span': self._calculate_time_span(errors)
-                })
-        
-        report_data['correlation_groups'] = sorted(
-            correlation_summary, 
-            key=lambda x: x['error_count'], 
-            reverse=True
-        )[:20]  # Top 20 correlation groups
-        
-        # Include monitoring summary
-        if self.monitoring_errors:
-            report_data['monitoring_summary'] = {
-                comp: len(errors) for comp, errors in self.monitoring_errors.items()
+        # Process error groups
+        for sig, errors in error_groups.items():
+            group = {
+                'signature': sig,
+                'count': len(errors),
+                'message': errors[0]['message'],  # Clean message
+                'severity': errors[0]['severity'],
+                'component': errors[0]['component'],
+                'pattern_id': errors[0]['pattern_id'],
+                'samples': errors[:3],  # Keep first 3 full samples
+                'files': list(set(e['file_path'] for e in errors)),
+                'has_correlation': any(e.get('correlation_id') for e in errors),
+                'has_stack_trace': any(e.get('stack_trace') for e in errors)
             }
+            report['error_groups'].append(group)
         
-        # Print enhanced top errors
-        print(f"{'='*80}")
-        print(f"TOP ERRORS WITH ENHANCED CONTEXT")
-        print(f"{'='*80}")
+        print(f"✅ Built {len(report['error_groups'])} error groups")
         
-        all_messages = []
-        for component, clusters in self.message_based_clusters.items():
-            for cluster in clusters:
-                all_messages.append({
-                    'component': component,
-                    'message': cluster['message'],
-                    'count': cluster['count'],
-                    'severity': cluster['severity'],
-                    'has_context': cluster['full_context_available'],
-                    'has_correlation': cluster['has_correlation']
-                })
+        # Sort by frequency
+        report['error_groups'].sort(key=lambda x: x['count'], reverse=True)
+        report['top_errors'] = report['error_groups'][:10]
         
-        all_messages.sort(key=lambda x: x['count'], reverse=True)
+        print(f"📊 Top error: {report['top_errors'][0]['message'][:100] if report['top_errors'] else 'NONE'}")
         
-        for msg_info in all_messages[:5]:
-            severity_emoji = '🔴' if msg_info['severity'] == 'CRITICAL' else '🟡' if msg_info['severity'] == 'ERROR' else '🟠'
-            context_indicator = ' 📚' if msg_info['has_context'] else ''
-            correlation_indicator = ' 🔗' if msg_info['has_correlation'] else ''
-            
-            print(f"\n{severity_emoji} [{msg_info['component']}] {msg_info['count']} occurrences{context_indicator}{correlation_indicator}")
-            print(f"   {msg_info['message'][:150]}")
-        
-        # Save enhanced report
-        self._save_json_report(report_data)
-        
-        print(f"\n{'='*80}")
-        print(f"✅ Analysis complete with enhanced context extraction")
-        print(f"💾 Report saved with full error context and correlation data")
-        print(f"{'='*80}\n")
-        
-        return report_data
+        return report
     
-    def _calculate_time_span(self, errors: List[ErrorMatch]) -> Optional[str]:
-        """Calculate time span for a group of errors"""
-        timestamps = [e.timestamp for e in errors if e.timestamp]
-        if not timestamps:
-            return None
+    def _create_signature(self, error: Dict) -> str:
+        """Create signature for grouping similar errors"""
+        # Use pattern_id + normalized message
+        message = error.get('message', '')
         
-        min_time = min(timestamps)
-        max_time = max(timestamps)
-        diff = max_time - min_time
+        # Normalize message
+        normalized = re.sub(r'\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}', 'TIMESTAMP', message)
+        normalized = re.sub(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', 'UUID', normalized)
+        normalized = re.sub(r'\b\d+\b', 'N', normalized)
         
-        if diff.total_seconds() < 1:
-            return "< 1 second"
-        elif diff.total_seconds() < 60:
-            return f"{int(diff.total_seconds())} seconds"
-        elif diff.total_seconds() < 3600:
-            return f"{int(diff.total_seconds() / 60)} minutes"
+        return f"{error['pattern_id']}:{normalized[:100]}"
+    
+    def _group_by_severity(self, results: List[Dict]) -> Dict[str, int]:
+        """Group errors by severity"""
+        severity_counts = defaultdict(int)
+        for error in results:
+            severity_counts[error['severity']] += 1
+        return dict(severity_counts)
+    
+    def _group_by_component(self, results: List[Dict]) -> Dict[str, int]:
+        """Group errors by component"""
+        component_counts = defaultdict(int)
+        for error in results:
+            component_counts[error['component']] += 1
+        return dict(component_counts)
+    
+    def _extract_tar(self, tar_path: str, dest: str) -> List[Path]:
+        """Extract tar and return file paths"""
+        files = []
+        
+        if tar_path.endswith('.gz'):
+            mode = 'r:gz'
         else:
-            return f"{diff.total_seconds() / 3600:.1f} hours"
-    
-    def _save_json_report(self, report_data: Dict[str, Any]):
-        """Save report to JSON file in proper location"""
-        from pathlib import Path
-        
-        # Create reports directory if it doesn't exist
-        reports_dir = Path("data/reports")
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Generate filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"autogrep_enhanced_report_{timestamp}.json"
-        filepath = reports_dir / filename
-        
-        # Save to the reports directory
-        with open(filepath, 'w') as f:
-            json.dump(report_data, f, indent=2, default=str)
-        
-        print(f"\n💾 Report saved to: {filepath}")
-        
-        # Optional: Clean up old reports (keep last 20)
-        self._cleanup_old_reports(reports_dir)
-    
-    def _cleanup_old_reports(self, reports_dir: Path, keep_count: int = 20):
-        """Clean up old report files, keeping only the most recent ones"""
-        try:
-            # Get all autogrep report files
-            report_files = sorted(
-                reports_dir.glob("autogrep_*_report_*.json"),
-                key=lambda f: f.stat().st_mtime,
-                reverse=True  # Most recent first
-            )
+            mode = 'r'
             
-            # Delete older files if we have too many
-            if len(report_files) > keep_count:
-                for old_file in report_files[keep_count:]:
-                    old_file.unlink()
-                    if mp.current_process().name == 'MainProcess':
-                        print(f"  🗑️ Cleaned up old report: {old_file.name}")
-        except Exception as e:
-            # Don't fail if cleanup fails
-            pass
+        with tarfile.open(tar_path, mode) as tar:
+            tar.extractall(dest)
+            
+            for root, _, filenames in os.walk(dest):
+                for filename in filenames:
+                    files.append(Path(root) / filename)
+        
+        return files
 
 
-def main():
-    """Main entry point"""
-    if len(sys.argv) < 2:
-        print("Usage: python autogrep.py <gitlab_sos_dump.tar.gz> [workers]")
-        sys.exit(1)
-    
-    tar_file = sys.argv[1]
-    workers = int(sys.argv[2]) if len(sys.argv) > 2 else None
-    
-    if not os.path.exists(tar_file):
-        print(f"❌ File not found: {tar_file}")
-        sys.exit(1)
-    
-    analyzer = AutoGrep(workers=workers)
-    report = analyzer.analyze_tar(tar_file)
-    
-    # Return exit code based on errors found
-    sys.exit(0 if report['summary']['errors_found'] == 0 else 1)
-
+# Export main class
+AutoGrep = TurboAutoGrep
 
 if __name__ == "__main__":
     main()

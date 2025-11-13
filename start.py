@@ -184,6 +184,7 @@ try:
     import fastapi
     import multipart
     import aiohttp
+    import aiofiles
     import pandas
     import numpy
     import uvicorn
@@ -292,6 +293,7 @@ except Exception as e:
             "fastapi==0.104.1",
             "uvicorn[standard]==0.24.0",
             "aiohttp==3.12.14",
+            "aiofiles==23.2.1",
             "websockets==12.0",
             numpy_spec,  # Dynamic numpy version
             pandas_spec,  # Dynamic pandas version

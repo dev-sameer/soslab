@@ -1432,7 +1432,7 @@ const EnhancedLogViewer1 = ({ sessionId, analysisData, initialFile, initialLine 
                             )}
                         </div>
 
-                        <div className="flex-1 overflow-y-auto font-mono text-sm" style={{ background: 'var(--bg-primary)' }}>
+                        <div className="flex-1 overflow-y-auto font-mono" style={{ background: 'var(--bg-primary)', fontSize: '0.75rem' }}>
                             {loading ? (
                                 <div className="flex items-center justify-center h-full">
                                     <div className="animate-spin w-8 h-8 border-3 border-current border-t-transparent rounded-full" style={{ borderColor: 'var(--text-tertiary)' }} />
@@ -2372,9 +2372,11 @@ const TabWithRename = ({ node, isActive, onSelect, onRename, onClose }) => {
                 isActive ? 'border-b-3' : ''
             }`}
             style={{
-                background: isActive ? 'var(--bg-primary)' : 'transparent',
-                borderBottom: isActive ? '3px solid var(--accent)' : 'none',
-                borderRight: '1px solid var(--border-primary)',
+                background: isActive ? 'var(--bg-primary)' : 'var(--bg-secondary)',
+                border: isActive ? '2px solid var(--accent)' : '1px solid transparent',
+                borderRadius: '8px',
+                boxShadow: isActive ? '0 -2px 8px rgba(0,0,0,0.1)' : 'none',
+                marginTop: isActive ? '0' : '4px',
                 minWidth: '160px',
                 maxWidth: '280px',
                 height: '40px'
@@ -2676,7 +2678,8 @@ function App() {
                     <div className="flex items-center" style={{ 
                         background: 'var(--bg-secondary)', 
                         borderBottom: '1px solid var(--border-primary)',
-                        height: '40px' // Fixed height like Chrome tabs
+                        height: '44px',
+                        paddingTop: '4px'
                     }}>
                         <div className="flex-1 flex overflow-x-auto scrollbar-thin" style={{
                             scrollbarWidth: 'thin',
