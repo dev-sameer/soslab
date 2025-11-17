@@ -34,8 +34,12 @@ from datetime import datetime
 import json
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import multiprocessing as mp
+import pickle
+import aiofiles
+import uuid
+from asyncio import create_task, Queue
 
 try:
     from fast_stats_service import FastStatsService
@@ -67,13 +71,86 @@ except ImportError as e:
         return UnixMCPServer(base_dir=base_dir)
     import threading
 
+# Import GitLab Duo analyzer with proper error handling
+try:
+    from gitlab_duo_analyzer import GitLabDuoRESTAnalyzer
+    DUO_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  GitLab Duo analyzer not available: {e}")
+    DUO_AVAILABLE = False
+    GitLabDuoRESTAnalyzer = None
+
 
 # Initialize components
 power_search = PowerSearchEngine()
 duo_chat = GitLabDuoChatIntegration()
 
-# OPTIMIZATION: Increase thread pool size for better parallelization
-thread_pool = ThreadPoolExecutor(max_workers=min(8, mp.cpu_count()))  # Increased from 3
+# Initialize REST analyzer
+duo_rest_analyzer = GitLabDuoRESTAnalyzer() if GitLabDuoRESTAnalyzer else None
+
+# Debug: Check if analyzer is properly initialized
+if duo_rest_analyzer:
+    print(f"✅ GitLab Duo REST Analyzer initialized")
+    print(f"   URL: {duo_rest_analyzer.gitlab_url}")
+    print(f"   Enabled: {duo_rest_analyzer.enabled}")
+else:
+    print("❌ GitLab Duo REST Analyzer is None")
+
+# ============== WORKER CONFIGURATION ==============
+
+# Determine optimal worker counts based on system
+CPU_COUNT = mp.cpu_count()
+
+# For file I/O operations (reading logs) - can be higher than CPU count
+IO_WORKERS = min(CPU_COUNT * 2, 16)  # 2x CPUs, max 16
+
+# For CPU-intensive pattern matching - should match CPU count  
+CPU_WORKERS = min(CPU_COUNT, 8)  # Match CPUs, max 8
+
+# Concurrent analysis limit - prevent resource exhaustion
+MAX_CONCURRENT_ANALYSES = 3  # Max 3 analyses running simultaneously
+
+# Create separate executors for different tasks
+thread_executor_io = ThreadPoolExecutor(
+    max_workers=IO_WORKERS,
+    thread_name_prefix="autogrep-io-"
+)
+
+thread_executor_cpu = ThreadPoolExecutor(
+    max_workers=CPU_WORKERS,
+    thread_name_prefix="autogrep-cpu-"
+)
+
+# Semaphore to limit concurrent analyses
+from threading import Semaphore
+analysis_semaphore = Semaphore(MAX_CONCURRENT_ANALYSES)
+
+# Track active analyses
+active_analyses = {}
+
+# Legacy thread pool for other operations
+thread_pool = ThreadPoolExecutor(max_workers=min(8, mp.cpu_count()))
+
+# Create a process pool for heavy analysis work
+process_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT_ANALYSES)
+
+# Add persistent state storage
+ANALYSIS_STATE_DIR = Path("data/analysis_state")
+ANALYSIS_STATE_DIR.mkdir(exist_ok=True, parents=True)
+
+# WebSocket connections for real-time updates
+websocket_connections: Dict[str, Set[WebSocket]] = defaultdict(set)
+
+# Progress queue for real-time updates
+progress_queues: Dict[str, Queue] = {}
+
+print(f"""
+🖥️  System Configuration:
+   CPU Cores: {CPU_COUNT}
+   I/O Workers: {IO_WORKERS}
+   CPU Workers: {CPU_WORKERS}
+   Max Concurrent Analyses: {MAX_CONCURRENT_ANALYSES}
+""")
 
 try:
     fast_stats_service = FastStatsService() if FastStatsService else None
@@ -95,6 +172,34 @@ app.add_middleware(
 analysis_sessions = {}
 extracted_files = {}
 auto_analysis_sessions = {}  # Store auto-analysis results separately
+
+# Analysis state manager
+class AnalysisStateManager:
+    """Manages persistent state for analyses"""
+    
+    @staticmethod
+    async def save_state(session_id: str, state: dict):
+        """Save analysis state to disk"""
+        state_file = ANALYSIS_STATE_DIR / f"{session_id}.json"
+        async with aiofiles.open(state_file, 'w') as f:
+            await f.write(json.dumps(state, default=str))
+    
+    @staticmethod
+    async def load_state(session_id: str) -> Optional[dict]:
+        """Load analysis state from disk"""
+        state_file = ANALYSIS_STATE_DIR / f"{session_id}.json"
+        if state_file.exists():
+            async with aiofiles.open(state_file, 'r') as f:
+                content = await f.read()
+                return json.loads(content)
+        return None
+    
+    @staticmethod
+    async def delete_state(session_id: str):
+        """Delete analysis state from disk"""
+        state_file = ANALYSIS_STATE_DIR / f"{session_id}.json"
+        if state_file.exists():
+            state_file.unlink()
 
 
 
@@ -290,55 +395,55 @@ class SystemMetricsParser:
             return default
     
     def _parse_top_res(self, file_path: Path) -> Dict:
-      """Parse top sorted by RES (memory) - same as top_cpu but different sort"""
-      # Use the same parser as top_cpu since format is identical
-      result = self._parse_top_cpu(file_path)
-    
-      # Mark that this was sorted by RES
-      result['_sort_by'] = 'RES'
-    
-      # Re-sort processes by memory if we have them
-      if result.get('processes'):
-          # Sort by mem percentage if available, otherwise by RES value
-          result['processes'] = sorted(
-              result['processes'],
-              key=lambda p: (
-                  p.get('mem', 0),  # Primary sort by memory percentage
-                  self._parse_memory_value(p.get('res', '0'))  # Secondary by RES value
-              ),
-              reverse=True
-          )
-    
-      return result
+        """Parse top sorted by RES (memory) - same as top_cpu but different sort"""
+        # Use the same parser as top_cpu since format is identical
+        result = self._parse_top_cpu(file_path)
+        
+        # Mark that this was sorted by RES
+        result['_sort_by'] = 'RES'
+        
+        # Re-sort processes by memory if we have them
+        if result.get('processes'):
+            # Sort by mem percentage if available, otherwise by RES value
+            result['processes'] = sorted(
+                result['processes'],
+                key=lambda p: (
+                    p.get('mem', 0),  # Primary sort by memory percentage
+                    self._parse_memory_value(p.get('res', '0'))  # Secondary by RES value
+                ),
+                reverse=True
+            )
+        
+        return result
     
     def _parse_memory_value(self, mem_str: str) -> float:
-      """Convert memory string (e.g., '1.2g', '512m') to MB for sorting"""
-      if not mem_str or mem_str == '-':
-          return 0
-    
-      mem_str = str(mem_str).strip().lower()
-    
-      # Handle different units
-      multipliers = {
-          'k': 1/1024,
-          'm': 1,
-          'g': 1024,
-          't': 1024 * 1024
-      }
-    
-      for suffix, multiplier in multipliers.items():
-          if suffix in mem_str:
-              try:
-                  num = float(mem_str.replace(suffix, ''))
-                  return num * multiplier
-              except ValueError:
-                  return 0
-    
-    # No suffix, try to parse as number
-      try:
-          return float(mem_str)
-      except ValueError:
-          return 0
+        """Convert memory string (e.g., '1.2g', '512m') to MB for sorting"""
+        if not mem_str or mem_str == '-':
+            return 0
+        
+        mem_str = str(mem_str).strip().lower()
+        
+        # Handle different units
+        multipliers = {
+            'k': 1/1024,
+            'm': 1,
+            'g': 1024,
+            't': 1024 * 1024
+        }
+        
+        for suffix, multiplier in multipliers.items():
+            if suffix in mem_str:
+                try:
+                    num = float(mem_str.replace(suffix, ''))
+                    return num * multiplier
+                except ValueError:
+                    return 0
+        
+        # No suffix, try to parse as number
+        try:
+            return float(mem_str)
+        except ValueError:
+            return 0
 
     
     def _parse_top_cpu(self, file_path: Path) -> Dict:
@@ -3183,51 +3288,307 @@ async def delete_specific_session(session_id: str):
     except Exception as e:
         raise HTTPException(500, f"Failed to delete session: {str(e)}")
 
+# Helper functions for improved auto-analysis
+def run_analysis_in_process(file_path: str, session_id: str, progress_queue_id: str):
+    """Run analysis in a separate process - completely isolated"""
+    import asyncio
+    import multiprocessing as mp
+    
+    # Create a new event loop for this process
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # This runs in a separate process - won't block main app
+    try:
+        # Import here to avoid serialization issues
+        from autogrep import AutoGrep
+        
+        analyzer = AutoGrep(workers=min(mp.cpu_count(), 8))
+        
+        # Create a progress callback
+        def progress_callback(progress_data):
+            # Send progress updates via pickle file
+            try:
+                with open(f"/tmp/progress_{progress_queue_id}.pkl", 'wb') as f:
+                    pickle.dump(progress_data, f)
+            except:
+                pass
+        
+        # Run the analysis
+        result = loop.run_until_complete(
+            analyzer.analyze_tar_streaming(file_path, callback=progress_callback)
+        )
+        
+        return result
+        
+    finally:
+        loop.close()
+
+
+async def notify_websockets(session_id: str, state: dict):
+    """Notify all WebSocket clients about state changes"""
+    if session_id in websocket_connections:
+        disconnected = set()
+        for ws in websocket_connections[session_id]:
+            try:
+                await ws.send_json(state)
+            except:
+                disconnected.add(ws)
+        
+        # Remove disconnected clients
+        websocket_connections[session_id] -= disconnected
+
+
+async def run_auto_analysis_task_improved(session_id: str):
+    """Improved non-blocking analysis task"""
+    try:
+        # Generate unique ID for this analysis
+        analysis_id = str(uuid.uuid4())
+        
+        # Initial state
+        state = {
+            'session_id': session_id,
+            'analysis_id': analysis_id,
+            'status': 'processing',
+            'started_at': datetime.now().isoformat(),
+            'progress': 0,
+            'message': 'Initializing analysis...',
+            'current_file': None,
+            'files_processed': 0,
+            'errors_found': 0
+        }
+        
+        # Save initial state
+        await AnalysisStateManager.save_state(session_id, state)
+        auto_analysis_sessions[session_id] = state
+        
+        # Find the file
+        upload_path = Path("data/uploads")
+        original_file = None
+        for file in upload_path.iterdir():
+            if session_id in file.name and file.is_file():
+                original_file = file
+                break
+        
+        if not original_file:
+            raise Exception(f"Original file not found for session {session_id}")
+        
+        # Create progress monitoring task
+        progress_queue_id = analysis_id
+        
+        async def monitor_progress():
+            """Monitor progress from the subprocess"""
+            last_update = time.time()
+            while state['status'] == 'processing':
+                try:
+                    # Check for progress updates from subprocess
+                    progress_file = f"/tmp/progress_{progress_queue_id}.pkl"
+                    if os.path.exists(progress_file):
+                        with open(progress_file, 'rb') as f:
+                            progress_data = pickle.load(f)
+                        
+                        # Update state with progress
+                        state.update(progress_data)
+                        state['last_update'] = time.time()
+                        
+                        # Save state
+                        await AnalysisStateManager.save_state(session_id, state)
+                        
+                        # Notify WebSocket clients
+                        await notify_websockets(session_id, state)
+                        
+                        os.remove(progress_file)
+                    
+                    await asyncio.sleep(0.1)  # Check every 100ms
+                    
+                except Exception as e:
+                    print(f"Progress monitoring error: {e}")
+                    await asyncio.sleep(0.5)
+        
+        # Start progress monitoring
+        monitor_task = create_task(monitor_progress())
+        
+        # Run analysis in separate process - THIS WON'T BLOCK
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            process_pool,
+            run_analysis_in_process,
+            str(original_file),
+            session_id,
+            progress_queue_id
+        )
+        
+        # Analysis completed
+        monitor_task.cancel()
+        
+        # Process results (convert to the format expected by frontend)
+        all_problems = []
+        problem_rank = 1
+        
+        for group in result.get('error_groups', []):
+            all_problems.append({
+                "rank": problem_rank,
+                "component": group['component'],
+                "pattern": group.get('pattern', '')[:200],
+                "pattern_id": group['pattern_id'],
+                "severity": group['severity'],
+                "description": group.get('message', ''),
+                "count": group['count'],
+                "files": group['files'][:10],
+                "message": group['message'],
+                "samples": group['samples'],
+                "sample_line": group['samples'][0]['full_line'] if group['samples'] else '',
+                "sample_file": group['files'][0] if group['files'] else 'unknown',
+                "signature": group['signature'],
+                "full_context": group['samples'][0].get('full_context', '') if group['samples'] else '',
+                "context_before": group['samples'][0].get('context_before', []) if group['samples'] else [],
+                "context_after": group['samples'][0].get('context_after', []) if group['samples'] else [],
+                "has_correlation": group['has_correlation'],
+                "has_stack_trace": group['has_stack_trace'],
+                "correlation_id": group['samples'][0].get('correlation_id') if group['samples'] else None,
+                "request_id": group['samples'][0].get('request_id') if group['samples'] else None,
+                "error_code": group['samples'][0].get('error_code') if group['samples'] else None,
+                "stack_trace": group['samples'][0].get('stack_trace') if group['samples'] else None,
+                "json_fields": group['samples'][0].get('json_fields', {}) if group['samples'] else {},
+                "is_monitoring": False
+            })
+            problem_rank += 1
+        
+        monitoring_problems = [p for p in all_problems if 'monitoring' in p['component'].lower()]
+        summary = result.get('summary', {})
+        component_stats = result.get('errors_by_component', {})
+        severity_breakdown = result.get('errors_by_severity', {})
+        
+        results_data = {
+            "analysis_duration": summary.get('end_time', 0) - summary.get('start_time', 0) if summary else 0,
+            "total_problems": result.get('total_errors', 0),
+            "gitlab_problems": len(all_problems) - len(monitoring_problems),
+            "monitoring_issues": len(monitoring_problems),
+            "unique_patterns": len(all_problems),
+            "problems": all_problems,
+            "monitoring_problems": monitoring_problems,
+            "component_stats": component_stats,
+            "severity_breakdown": severity_breakdown,
+            "summary": summary,
+            "metadata": {
+                "files_processed": summary.get('files_processed', 0),
+                "lines_processed": summary.get('lines_processed', 0),
+                "analysis_duration_seconds": summary.get('end_time', 0) - summary.get('start_time', 0) if summary else 0,
+                "pattern_bank_size": 0,
+                "turbo_mode": True
+            }
+        }
+        
+        # Final state
+        final_state = {
+            'session_id': session_id,
+            'analysis_id': analysis_id,
+            'status': 'completed',
+            'completed_at': datetime.now().isoformat(),
+            'results': results_data,
+            'progress': 100,
+            'message': 'Analysis completed!'
+        }
+        
+        # Save final state
+        await AnalysisStateManager.save_state(session_id, final_state)
+        auto_analysis_sessions[session_id] = final_state
+        
+        # Notify completion
+        await notify_websockets(session_id, final_state)
+        
+    except Exception as e:
+        print(f"Analysis failed: {e}")
+        import traceback
+        traceback.print_exc()
+        error_state = {
+            'session_id': session_id,
+            'status': 'failed',
+            'error': str(e),
+            'progress': 0
+        }
+        await AnalysisStateManager.save_state(session_id, error_state)
+        auto_analysis_sessions[session_id] = error_state
+        await notify_websockets(session_id, error_state)
+
+
 # Auto-Analysis endpoints (OPTIMIZED)
 @app.post("/api/auto-analysis/{session_id}")
 async def start_auto_analysis(session_id: str, background_tasks: BackgroundTasks):
-    """Start auto-analysis using autogrep.py in the background"""
+    """Start auto-analysis with improved state management"""
     
     if session_id not in extracted_files:
         raise HTTPException(404, "Session not found")
     
-    # Check if auto-analysis is already running or completed
-    if session_id in auto_analysis_sessions:
-        current_status = auto_analysis_sessions[session_id].get('status')
-        if current_status == 'processing':
-            return {
-                "session_id": session_id,
-                "status": "already_running",
-                "message": "Auto-analysis is already in progress"
-            }
-        elif current_status == 'completed':
-            return {
-                "session_id": session_id,
-                "status": "already_completed",
-                "message": "Auto-analysis already completed",
-                "results": auto_analysis_sessions[session_id]
-            }
+    # Check for existing state (including from previous runs)
+    existing_state = await AnalysisStateManager.load_state(session_id)
     
-    # Initialize auto-analysis session
-    auto_analysis_sessions[session_id] = {
-        "session_id": session_id,
-        "status": "processing",
-        "started_at": datetime.now().isoformat(),
-        "progress": 0,
-        "message": "Starting auto-analysis..."
-    }
+    if existing_state:
+        if existing_state.get('status') == 'processing':
+            # Check if it's actually still running
+            if existing_state.get('last_update'):
+                if time.time() - existing_state['last_update'] < 30:  # Updated in last 30s
+                    return existing_state
+            
+            # Stale processing state - restart
+            await AnalysisStateManager.delete_state(session_id)
+        
+        elif existing_state.get('status') == 'completed':
+            return existing_state
     
-    # Start background task
-    background_tasks.add_task(run_auto_analysis_task, session_id)
+    # Start new analysis in background
+    create_task(run_auto_analysis_task_improved(session_id))
     
     return {
-        "session_id": session_id,
-        "status": "started",
-        "message": "Auto-analysis started in background"
+        'session_id': session_id,
+        'status': 'started',
+        'message': 'Analysis started in background'
     }
 
 # OPTIMIZED run_auto_analysis_task function
 # Replace the entire run_auto_analysis_task function with this COMPLETE version
+
+# Analysis locks for tracking
+analysis_locks = {}  # Track which sessions are being analyzed
+
+# Old function removed - using run_analysis_with_workers instead
+def _old_run_analysis_sync_removed(file_path: str, session_id: str) -> Dict:
+    """Synchronous analysis function to run in thread/process"""
+    import asyncio
+    
+    # Update progress periodically
+    def update_progress(message: str, progress: int):
+        auto_analysis_sessions[session_id].update({
+            "progress": progress,
+            "message": message
+        })
+    
+    update_progress("✅ Initialized with 664 patterns", 30)
+    
+    # Create new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        # Create analyzer
+        optimal_workers = min(mp.cpu_count(), 8)
+        analyzer = AutoGrep(workers=optimal_workers)
+        
+        update_progress("⚡ Processing files with parallel workers...", 40)
+        
+        # Run async analysis in the new loop
+        report = loop.run_until_complete(
+            analyzer.analyze_tar_streaming(file_path)
+        )
+        
+        update_progress("� Processing results...", 80)
+        
+        return report
+        
+    finally:
+        loop.close()
+
+
 
 async def run_auto_analysis_task(session_id: str):
     """Background task to run auto-analysis - COMPLETE DATA EXTRACTION"""
@@ -3237,7 +3598,7 @@ async def run_auto_analysis_task(session_id: str):
         auto_analysis_sessions[session_id].update({
             "status": "processing",
             "progress": 10,
-            "message": "Initializing pattern hunter..."
+            "message": "🎯 Initializing AutoGrep..."
         })
         
         # Find original file
@@ -3256,164 +3617,132 @@ async def run_auto_analysis_task(session_id: str):
         print(f"📦 Using original upload: {original_file.name}")
         
         auto_analysis_sessions[session_id].update({
-            "progress": 30,
-            "message": "Running pattern analysis..."
+            "progress": 20,
+            "message": "📦 Extracting archive..."
         })
         
-        def run_analysis():
-            print(f"🎯 Initializing AutoGrep...")
-            optimal_workers = min(mp.cpu_count(), 8)
-            analyzer = AutoGrep(workers=optimal_workers)
-            print(f"✅ AutoGrep initialized with {len(analyzer.pattern_bank.patterns)} patterns")
-            
-            auto_analysis_sessions[session_id].update({
-                "progress": 50,
-                "message": "Analyzing patterns..."
-            })
-            
-            # Run analysis
-            start_time = time.time()
-            report = analyzer.analyze_tar(str(original_file))
-            analysis_duration = time.time() - start_time
-            print(f"✅ Pattern analysis completed in {analysis_duration:.1f}s")
-            
-            auto_analysis_sessions[session_id].update({
-                "progress": 80,
-                "message": "Processing results..."
-            })
-            
-            # CRITICAL FIX: Extract ALL problems from ALL error clusters
-            all_problems = []
-            problem_rank = 1
-            
-            # Process error_clusters from AutoGrep (the main GitLab errors)
-            if hasattr(analyzer, 'error_clusters'):
-                for component, clusters in analyzer.error_clusters.items():
-                    for signature, errors in clusters:
-                        if errors:
-                            sample = errors[0]
-                            
-                            # Get unique files
-                            unique_files = list(set(
-                                os.path.basename(e.file_path) for e in errors[:10]
-                            ))
-                            
-                            all_problems.append({
-                                "rank": problem_rank,
-                                "component": component,
-                                "pattern": sample.pattern.pattern[:200],
-                                "pattern_id": sample.pattern.id,
-                                "severity": sample.pattern.severity,
-                                "description": sample.pattern.description or "",
-                                "count": len(errors),
-                                "files": unique_files,
-                                "sample_line": sample.line[:500],
-                                "sample_file": unique_files[0] if unique_files else "unknown",
-                                "signature": signature,
-                                "is_monitoring": False
-                            })
-                            problem_rank += 1
-            
-            # Also check the report's gitlab_components for any missed patterns
-            gitlab_components = report.get('gitlab_components', {})
-            for component, issues in gitlab_components.items():
-                for issue in issues:
-                    # Check if we already have this pattern
-                    pattern_id = issue.get('pattern_id', '')
-                    if not any(p['pattern_id'] == pattern_id and p['component'] == component 
-                              for p in all_problems):
-                        all_problems.append({
-                            "rank": problem_rank,
-                            "component": component,
-                            "pattern": issue.get('pattern', '')[:200],
-                            "pattern_id": pattern_id,
-                            "severity": issue.get('severity', 'ERROR'),
-                            "description": issue.get('description', ''),
-                            "count": issue.get('count', 0),
-                            "files": issue.get('files', []),
-                            "sample_line": issue.get('sample', ''),
-                            "sample_file": issue.get('files', ['unknown'])[0] if issue.get('files') else 'unknown',
-                            "signature": f"{component}_{pattern_id}",
-                            "is_monitoring": False
-                        })
-                        problem_rank += 1
-            
-            # Process monitoring errors separately
-            monitoring_problems = []
-            if hasattr(analyzer, 'monitoring_clusters'):
-                for component, clusters in analyzer.monitoring_clusters.items():
-                    for signature, errors in clusters:
-                        if errors:
-                            sample = errors[0]
-                            unique_files = list(set(
-                                os.path.basename(e.file_path) for e in errors[:10]
-                            ))
-                            
-                            monitoring_problems.append({
-                                "component": component,
-                                "pattern": sample.pattern.pattern[:200],
-                                "pattern_id": sample.pattern.id,
-                                "severity": sample.pattern.severity,
-                                "description": sample.pattern.description or "",
-                                "count": len(errors),
-                                "files": unique_files,
-                                "sample_line": sample.line[:500],
-                                "is_monitoring": True
-                            })
-            
-            # Get summary data
-            summary = report.get('summary', {})
-            
-            # Build component statistics from actual problems
-            component_stats = {}
-            for problem in all_problems:
-                comp = problem['component']
-                if comp not in component_stats:
-                    component_stats[comp] = 0
-                component_stats[comp] += problem['count']
-            
-            # Calculate severity breakdown from actual problems
-            severity_breakdown = {"CRITICAL": 0, "ERROR": 0, "WARNING": 0}
-            for problem in all_problems:
-                severity = problem['severity'].upper()
-                if severity in severity_breakdown:
-                    severity_breakdown[severity] += problem['count']
-            
-            print(f"📊 Extracted {len(all_problems)} GitLab problem patterns")
-            print(f"📊 Extracted {len(monitoring_problems)} monitoring patterns")
-            
-            return {
-                # Core metrics from summary
-                "analysis_duration": analysis_duration,
-                "total_problems": summary.get('errors_found', 0),
-                "gitlab_problems": summary.get('gitlab_errors', 0),
-                "monitoring_issues": summary.get('monitoring_errors', 0),
-                "unique_patterns": len(all_problems),
-                
-                # ALL problems
-                "problems": all_problems,
-                "monitoring_problems": monitoring_problems,
-                
-                # Statistics
-                "component_stats": component_stats,
-                "monitoring_stats": summary.get('monitoring_summary', {}),
-                "severity_breakdown": severity_breakdown,
-                
-                # Summary data
-                "summary": summary,
-                
-                # Metadata
-                "metadata": {
-                    "files_processed": summary.get('files_processed', 0),
-                    "lines_processed": summary.get('lines_processed', 0),
-                    "analysis_duration_seconds": analysis_duration,
-                    "pattern_bank_size": len(analyzer.pattern_bank.patterns) if hasattr(analyzer, 'pattern_bank') else 0
-                }
-            }
+        print(f"🎯 Initializing AutoGrep...")
+        optimal_workers = min(mp.cpu_count(), 8)
+        analyzer = AutoGrep(workers=optimal_workers)
+        print(f"✅ AutoGrep initialized with {len(analyzer.pattern_bank.patterns)} patterns")
         
-        # Run in thread pool
-        loop = asyncio.get_event_loop()
-        results_data = await loop.run_in_executor(thread_pool, run_analysis)
+        auto_analysis_sessions[session_id].update({
+            "progress": 30,
+            "message": f"✅ Initialized with {len(analyzer.pattern_bank.patterns)} patterns"
+        })
+        
+        # Run analysis with streaming
+        start_time = time.time()
+        
+        auto_analysis_sessions[session_id].update({
+            "progress": 40,
+            "message": "⚡ Processing files with parallel workers..."
+        })
+        
+        report = await analyzer.analyze_tar_streaming(str(original_file))
+        analysis_duration = time.time() - start_time
+        print(f"✅ Pattern analysis completed in {analysis_duration:.1f}s")
+        
+        auto_analysis_sessions[session_id].update({
+            "progress": 80,
+            "message": "📊 Processing results..."
+        })
+        
+        # DEBUG: Print report structure
+        print(f"📋 Report keys: {list(report.keys())}")
+        print(f"📋 Total errors in report: {report.get('total_errors', 0)}")
+        print(f"📋 Error groups count: {len(report.get('error_groups', []))}")
+        if report.get('error_groups'):
+            print(f"📋 First error group: {report['error_groups'][0]}")
+        
+        # CRITICAL FIX: Extract problems from the report's error_groups
+        all_problems = []
+        problem_rank = 1
+        
+        # The new TurboAutoGrep returns data in report['error_groups']
+        for group in report.get('error_groups', []):
+                # Each group has all the data we need
+                all_problems.append({
+                    "rank": problem_rank,
+                    "component": group['component'],
+                    "pattern": group.get('pattern', '')[:200],
+                    "pattern_id": group['pattern_id'],
+                    "severity": group['severity'],
+                    "description": group.get('message', ''),
+                    "count": group['count'],
+                    "files": group['files'][:10],  # First 10 files
+                    
+                    # CRITICAL: Include the clean message
+                    "message": group['message'],
+                    
+                    # Full samples with complete context
+                    "samples": group['samples'],
+                    
+                    # First sample details (for backward compatibility)
+                    "sample_line": group['samples'][0]['full_line'] if group['samples'] else '',
+                    "sample_file": group['files'][0] if group['files'] else 'unknown',
+                    "signature": group['signature'],
+                    
+                    # Context and metadata from first sample
+                    "full_context": group['samples'][0].get('full_context', '') if group['samples'] else '',
+                    "context_before": group['samples'][0].get('context_before', []) if group['samples'] else [],
+                    "context_after": group['samples'][0].get('context_after', []) if group['samples'] else [],
+                    "has_correlation": group['has_correlation'],
+                    "has_stack_trace": group['has_stack_trace'],
+                    "correlation_id": group['samples'][0].get('correlation_id') if group['samples'] else None,
+                    "request_id": group['samples'][0].get('request_id') if group['samples'] else None,
+                    "error_code": group['samples'][0].get('error_code') if group['samples'] else None,
+                    "stack_trace": group['samples'][0].get('stack_trace') if group['samples'] else None,
+                    "json_fields": group['samples'][0].get('json_fields', {}) if group['samples'] else {},
+                    
+                    "is_monitoring": False
+                })
+                problem_rank += 1
+        
+        # No separate monitoring problems in new version - all in error_groups
+        monitoring_problems = [p for p in all_problems if 'monitoring' in p['component'].lower()]
+        
+        # Get summary data from report
+        summary = report.get('summary', {})
+        
+        # Build component statistics from error_groups
+        component_stats = report.get('errors_by_component', {})
+        
+        # Get severity breakdown from report
+        severity_breakdown = report.get('errors_by_severity', {})
+        
+        print(f"📊 Extracted {len(all_problems)} problem patterns")
+        print(f"📊 Extracted {len(monitoring_problems)} monitoring patterns")
+        
+        # Build final results
+        results_data = {
+            # Core metrics
+            "analysis_duration": analysis_duration,
+            "total_problems": report.get('total_errors', 0),
+            "gitlab_problems": len(all_problems) - len(monitoring_problems),
+            "monitoring_issues": len(monitoring_problems),
+            "unique_patterns": len(all_problems),
+            
+            # ALL problems with full data
+            "problems": all_problems,
+            "monitoring_problems": monitoring_problems,
+            
+            # Statistics
+            "component_stats": component_stats,
+            "severity_breakdown": severity_breakdown,
+            
+            # Summary data
+            "summary": summary,
+            
+            # Metadata
+            "metadata": {
+                "files_processed": summary.get('files_processed', 0),
+                "lines_processed": summary.get('lines_processed', 0),
+                "analysis_duration_seconds": analysis_duration,
+                "pattern_bank_size": len(analyzer.pattern_bank.patterns),
+                "turbo_mode": True
+            }
+        }
         
         # Store results
         auto_analysis_sessions[session_id].update({
@@ -3444,16 +3773,23 @@ async def run_auto_analysis_task(session_id: str):
 
 @app.get("/api/auto-analysis/{session_id}")
 async def get_auto_analysis_status(session_id: str):
-    """Get auto-analysis status and results"""
+    """Get analysis status from persistent storage"""
     
-    if session_id not in auto_analysis_sessions:
-        return {
-            "session_id": session_id,
-            "status": "not_started",
-            "message": "Auto-analysis not started"
-        }
+    # Try memory first
+    if session_id in auto_analysis_sessions:
+        return auto_analysis_sessions[session_id]
     
-    return auto_analysis_sessions[session_id]
+    # Try persistent storage
+    state = await AnalysisStateManager.load_state(session_id)
+    if state:
+        auto_analysis_sessions[session_id] = state  # Cache it
+        return state
+    
+    return {
+        "session_id": session_id,
+        "status": "not_started",
+        "message": "Auto-analysis not started"
+    }
 
 @app.delete("/api/auto-analysis/{session_id}")
 async def clear_auto_analysis(session_id: str):
@@ -3472,6 +3808,451 @@ async def clear_auto_analysis(session_id: str):
         "status": "not_found",
         "message": "No auto-analysis results found"
     }
+
+@app.post("/api/auto-analysis/{session_id}/duo-feed")
+async def feed_to_duo(session_id: str, background_tasks: BackgroundTasks):
+    """Feed auto-analysis results to GitLab Duo"""
+    
+    # Check if Duo analyzer is available
+    if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
+        raise HTTPException(500, "Duo analyzer not available")
+    
+    # Check prerequisites
+    if session_id not in auto_analysis_sessions:
+        raise HTTPException(404, "No analysis found")
+    
+    if auto_analysis_sessions[session_id].get('status') != 'completed':
+        raise HTTPException(400, "Auto-analysis must complete first")
+    
+    if not os.getenv('GITLAB_TOKEN'):
+        raise HTTPException(400, "GITLAB_TOKEN not configured. Set it with: export GITLAB_TOKEN=your_token")
+    
+    # Check if Duo analysis already running/complete
+    existing = duo_rest_analyzer.get_session_status(session_id)
+    if existing:
+        if existing['status'] == 'processing':
+            return existing
+        elif existing['status'] == 'completed':
+            return existing  # Return cached results
+    
+    # Start Duo analysis in background
+    background_tasks.add_task(
+        run_duo_analysis,
+        session_id,
+        auto_analysis_sessions[session_id]['results']
+    )
+    
+    return {
+        'status': 'started',
+        'message': 'Duo analysis started',
+        'session_id': session_id
+    }
+
+async def run_duo_analysis(session_id: str, analysis_results: Dict):
+    """Background task for Duo analysis"""
+    try:
+        # Get error groups from results - check both 'error_groups' and 'problems'
+        error_groups = analysis_results.get('error_groups', [])
+        if not error_groups:
+            # Fall back to 'problems' if 'error_groups' not found
+            error_groups = analysis_results.get('problems', [])
+        
+        if not error_groups:
+            raise Exception("No error groups found in analysis results")
+        
+        print(f"🤖 Starting GitLab Duo analysis for {len(error_groups)} error patterns...")
+        
+        # Feed to Duo
+        result = await duo_rest_analyzer.analyze_errors_with_batching(session_id, error_groups)
+        
+        # Store in session
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_analysis'] = result
+        
+        print(f"✅ GitLab Duo analysis completed for session: {session_id}")
+        
+    except Exception as e:
+        print(f"❌ Duo analysis failed: {e}")
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_analysis'] = {
+                'status': 'failed',
+                'error': str(e)
+            }
+
+@app.get("/api/auto-analysis/{session_id}/duo-status")
+async def get_duo_status(session_id: str):
+    """Get Duo analysis status - DEPRECATED, redirects to duo-rest-status"""
+    
+    # Just redirect to the REST version
+    return await get_duo_rest_status(session_id)
+
+@app.delete("/api/auto-analysis/{session_id}/duo-clear")
+async def clear_duo_analysis(session_id: str):
+    """Clear Duo analysis for a session"""
+    
+    if DUO_AVAILABLE and duo_analyzer:
+        # Clear from duo_analyzer
+        if session_id in duo_rest_analyzer.active_conversations:
+            del duo_rest_analyzer.active_conversations[session_id]
+        
+        # Delete from disk
+        file_path = Path(f"data/duo_analysis/{session_id}.json")
+        if file_path.exists():
+            file_path.unlink()
+    
+    # Clear from auto_analysis_sessions
+    if session_id in auto_analysis_sessions:
+        if 'duo_analysis' in auto_analysis_sessions[session_id]:
+            del auto_analysis_sessions[session_id]['duo_analysis']
+    
+    return {'status': 'cleared', 'message': 'Duo analysis cleared'}
+
+
+@app.post("/api/auto-analysis/{session_id}/duo-feed-chunked")
+async def feed_to_duo_chunked(session_id: str, background_tasks: BackgroundTasks):
+    """Feed auto-analysis results to GitLab Duo using chunked approach"""
+    
+    # Check if Duo analyzer is available
+    if not duo_rest_analyzer.enabled:
+        raise HTTPException(500, "Duo analyzer not configured")
+    
+    # Check prerequisites
+    if session_id not in auto_analysis_sessions:
+        raise HTTPException(404, "No analysis found")
+    
+    if auto_analysis_sessions[session_id].get('status') != 'completed':
+        raise HTTPException(400, "Auto-analysis must complete first")
+    
+    if not os.getenv('GITLAB_TOKEN'):
+        raise HTTPException(400, "GITLAB_TOKEN not configured. Set it with: export GITLAB_TOKEN=**********")
+    
+    # Check if Duo analysis already running/complete
+    existing = duo_rest_analyzer.get_session_status(session_id)
+    if existing:
+        if existing['status'] == 'processing':
+            return existing
+        elif existing['status'] == 'completed':
+            return existing  # Return cached results
+    
+    # Start chunked Duo analysis in background
+    background_tasks.add_task(
+        run_chunked_duo_analysis,
+        session_id,
+        auto_analysis_sessions[session_id]['results']
+    )
+    
+    return {
+        'status': 'started',
+        'message': 'Chunked Duo analysis started',
+        'session_id': session_id
+    }
+
+
+@app.get("/api/auto-analysis/{session_id}/duo-status-enhanced")
+async def get_duo_status_enhanced(session_id: str):
+    """Get enhanced Duo analysis status with chunk progress"""
+    
+    if not duo_rest_analyzer.enabled:
+        return {'status': 'not_available', 'error': 'Duo analyzer not configured'}
+    
+    # Check from enhanced analyzer
+    status = duo_rest_analyzer.get_session_status(session_id)
+    
+    if status:
+        return status
+    
+    # Also check if stored in auto_analysis_sessions
+    if session_id in auto_analysis_sessions:
+        duo_data = auto_analysis_sessions[session_id].get('duo_analysis')
+        if duo_data:
+            return duo_data
+    
+    return {'status': 'not_started'}
+
+
+@app.delete("/api/auto-analysis/{session_id}/duo-clear-enhanced")
+async def clear_duo_analysis_enhanced(session_id: str):
+    """Clear Duo analysis for a session - enhanced version"""
+    
+    # Clear from enhanced analyzer
+    cleared = duo_rest_analyzer.clear_session(session_id)
+    
+    # Clear from auto_analysis_sessions
+    if session_id in auto_analysis_sessions:
+        if 'duo_analysis' in auto_analysis_sessions[session_id]:
+            del auto_analysis_sessions[session_id]['duo_analysis']
+    
+    return {
+        'status': 'cleared' if cleared else 'not_found',
+        'message': 'Duo analysis cleared' if cleared else 'No analysis found to clear'
+    }
+
+
+@app.websocket("/ws/duo-analysis/{session_id}")
+async def websocket_duo_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket for real-time Duo analysis updates"""
+    await websocket.accept()
+    
+    try:
+        # Send updates while processing
+        while True:
+            # Get current status
+            status = duo_rest_analyzer.get_session_status(session_id)
+            
+            if status:
+                await websocket.send_json(status)
+                
+                # Stop if completed or failed
+                if status['status'] in ['completed', 'failed']:
+                    break
+            
+            await asyncio.sleep(1)  # Update every second
+            
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        await websocket.close()
+
+
+@app.post("/api/auto-analysis/{session_id}/duo-rest-analyze")
+async def start_duo_rest_analysis(session_id: str, background_tasks: BackgroundTasks):
+    """Start Duo analysis using REST API with batching"""
+    
+    # Validate prerequisites
+    if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
+        raise HTTPException(500, "GitLab Duo not configured. Set GITLAB_TOKEN environment variable.")
+    
+    if session_id not in auto_analysis_sessions:
+        raise HTTPException(404, "Auto-analysis not found. Run auto-analysis first.")
+    
+    if auto_analysis_sessions[session_id].get('status') != 'completed':
+        raise HTTPException(400, "Auto-analysis must complete first")
+    
+    # Check for existing analysis
+    existing = duo_rest_analyzer.get_session_status(session_id)
+    if existing:
+        if existing['status'] == 'processing':
+            return existing
+        elif existing['status'] == 'completed':
+            return existing
+    
+    # Start analysis in background
+    background_tasks.add_task(
+        run_duo_rest_analysis,
+        session_id,
+        auto_analysis_sessions[session_id]['results']
+    )
+    
+    return {
+        'status': 'started',
+        'message': 'Duo REST API analysis started',
+        'session_id': session_id
+    }
+
+
+async def run_duo_rest_analysis(session_id: str, analysis_results: Dict):
+    """Background task for REST API Duo analysis"""
+    try:
+        # Extract error groups
+        error_groups = analysis_results.get('problems', [])
+        if not error_groups:
+            error_groups = analysis_results.get('error_groups', [])
+        
+        if not error_groups:
+            raise Exception("No error patterns found in analysis results")
+        
+        print(f"🤖 Starting GitLab Duo REST API analysis for {len(error_groups)} patterns...")
+        
+        # Run analysis with batching
+        result = await duo_rest_analyzer.analyze_errors_with_batching(session_id, error_groups)
+        
+        # Store result in session
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_rest_analysis'] = result
+        
+        print(f"✅ Duo REST analysis completed for session: {session_id}")
+        
+    except Exception as e:
+        print(f"❌ Duo REST analysis failed: {e}")
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_rest_analysis'] = {
+                'status': 'failed',
+                'error': str(e),
+                'current_message': f'Analysis failed: {str(e)}'
+            }
+
+
+@app.get("/api/auto-analysis/{session_id}/duo-rest-status")
+async def get_duo_rest_status(session_id: str):
+    """Get Duo REST analysis status"""
+    
+    if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
+        return {
+            'status': 'not_available',
+            'error': 'GitLab Duo not configured'
+        }
+    
+    # Check analyzer storage
+    status = duo_rest_analyzer.get_session_status(session_id)
+    if status:
+        return status
+    
+    # Check session memory
+    if session_id in auto_analysis_sessions:
+        duo_data = auto_analysis_sessions[session_id].get('duo_rest_analysis')
+        if duo_data:
+            return duo_data
+    
+    return {'status': 'not_started'}
+
+
+@app.delete("/api/auto-analysis/{session_id}/duo-rest-clear")
+async def clear_duo_rest_analysis(session_id: str):
+    """Clear Duo REST analysis"""
+    
+    if not duo_rest_analyzer:
+        return {'status': 'not_available'}
+    
+    # Clear from analyzer
+    cleared = duo_rest_analyzer.clear_session(session_id)
+    
+    # Clear from session memory
+    if session_id in auto_analysis_sessions:
+        if 'duo_rest_analysis' in auto_analysis_sessions[session_id]:
+            del auto_analysis_sessions[session_id]['duo_rest_analysis']
+    
+    return {
+        'status': 'cleared' if cleared else 'not_found',
+        'message': 'Duo analysis cleared successfully' if cleared else 'No analysis found'
+    }
+
+
+@app.get("/api/duo/test-connection")
+async def test_duo_connection():
+    """Test GitLab Duo API connection"""
+    
+    if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
+        return {
+            'connected': False,
+            'error': 'GITLAB_TOKEN not configured'
+        }
+    
+    try:
+        connected = await duo_rest_analyzer.test_connection()
+        return {
+            'connected': connected,
+            'gitlab_url': duo_rest_analyzer.gitlab_url,
+            'message': 'Connection successful' if connected else 'Connection failed'
+        }
+    except Exception as e:
+        return {
+            'connected': False,
+            'error': str(e)
+        }
+
+
+@app.post("/api/duo/configure-batching")
+async def configure_batching(config: Dict):
+    """Configure Duo batching parameters"""
+    
+    if not duo_rest_analyzer:
+        raise HTTPException(500, "Duo REST analyzer not available")
+    
+    if 'errors_per_batch' in config:
+        duo_rest_analyzer.errors_per_batch = max(1, min(50, config['errors_per_batch']))
+    
+    if 'timeout_seconds' in config:
+        duo_rest_analyzer.timeout_seconds = max(10, min(120, config['timeout_seconds']))
+    
+    if 'max_retries' in config:
+        duo_rest_analyzer.max_retries = max(1, min(5, config['max_retries']))
+    
+    return {
+        'errors_per_batch': duo_rest_analyzer.errors_per_batch,
+        'timeout_seconds': duo_rest_analyzer.timeout_seconds,
+        'max_retries': duo_rest_analyzer.max_retries
+    }
+
+
+# WebSocket for real-time updates
+@app.websocket("/ws/duo-rest/{session_id}")
+async def websocket_duo_rest(websocket: WebSocket, session_id: str):
+    """WebSocket for real-time Duo REST analysis updates"""
+    await websocket.accept()
+    
+    try:
+        while True:
+            # Get current status
+            if duo_rest_analyzer:
+                status = duo_rest_analyzer.get_session_status(session_id)
+                
+                if status:
+                    await websocket.send_json(status)
+                    
+                    # Exit if complete
+                    if status['status'] in ['completed', 'failed', 'partial']:
+                        break
+            
+            await asyncio.sleep(1)  # Update every second
+            
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        await websocket.close()
+
+
+@app.post("/api/duo/configure")
+async def configure_duo_chunking(config: Dict):
+    """Configure Duo chunking parameters"""
+    
+    if 'chunk_size' in config:
+        duo_rest_analyzer.chunk_size = config['chunk_size']
+    
+    if 'max_retries' in config:
+        duo_rest_analyzer.max_retries = config['max_retries']
+    
+    if 'timeout_seconds' in config:
+        duo_rest_analyzer.timeout_seconds = config['timeout_seconds']
+    
+    return {
+        'chunk_size': duo_rest_analyzer.chunk_size,
+        'max_retries': duo_rest_analyzer.max_retries,
+        'timeout_seconds': duo_rest_analyzer.timeout_seconds
+    }
+
+
+async def run_chunked_duo_analysis(session_id: str, analysis_results: Dict):
+    """Background task for chunked Duo analysis"""
+    try:
+        # Get error groups from results
+        error_groups = analysis_results.get('problems', [])
+        
+        if not error_groups:
+            # Try alternative keys
+            error_groups = analysis_results.get('error_groups', [])
+        
+        if not error_groups:
+            raise Exception("No error groups found in analysis results")
+        
+        print(f"🤖 Starting chunked GitLab Duo analysis for {len(error_groups)} error patterns...")
+        
+        # Feed to Duo using chunked approach
+        result = await duo_rest_analyzer.feed_errors_chunked(session_id, error_groups)
+        
+        # Store in session
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_analysis'] = result
+        
+        print(f"✅ Chunked Duo analysis completed for session: {session_id}")
+        
+    except Exception as e:
+        print(f"❌ Chunked Duo analysis failed: {e}")
+        if session_id in auto_analysis_sessions:
+            auto_analysis_sessions[session_id]['duo_analysis'] = {
+                'status': 'failed',
+                'error': str(e)
+            }
+
 
 @app.get("/api/logs/{session_id}/{file_path:path}/raw")
 async def get_raw_log(session_id: str, file_path: str):
@@ -3987,6 +4768,7 @@ async def extract_log_fields(
         raise HTTPException(500, f"Error extracting fields: {str(e)}")
 
 
+
 def ensure_localhost_only():
     """Refuse to start if not on localhost"""
     # Just check for cloud environments, not IP
@@ -4003,6 +4785,199 @@ def ensure_localhost_only():
             sys.exit(1)
     
     print("✅ Running in local environment")
+
+
+# Add to main.py - Enhanced auto-analysis endpoint
+
+async def run_turbo_auto_analysis(session_id: str):
+    """Turbo auto-analysis with streaming results"""
+    try:
+        print(f"🚀 Starting TURBO auto-analysis for session: {session_id}")
+        
+        # Find original file
+        upload_path = Path("data/uploads")
+        original_file = None
+        
+        for file in upload_path.iterdir():
+            if session_id in file.name and file.is_file():
+                original_file = file
+                break
+        
+        if not original_file:
+            raise Exception(f"Original file not found for session {session_id}")
+        
+        # Initialize turbo analyzer
+        analyzer = TurboAutoGrep(workers=min(mp.cpu_count(), 16))
+        
+        # Results accumulator
+        all_results = []
+        
+        # Streaming callback
+        async def stream_callback(result):
+            if result.get('type') == 'progress':
+                # Update progress
+                auto_analysis_sessions[session_id]['progress'] = result.get('progress_percent', 0)
+                auto_analysis_sessions[session_id]['message'] = f"Processing: {result.get('file', '')}"
+            else:
+                # Add to results
+                all_results.append(result)
+                
+                # Update live count
+                auto_analysis_sessions[session_id]['live_error_count'] = len(all_results)
+                
+                # Send first results immediately
+                if len(all_results) == 1:
+                    auto_analysis_sessions[session_id]['first_result_time'] = time.time()
+                
+                # Batch update every 10 errors
+                if len(all_results) % 10 == 0:
+                    auto_analysis_sessions[session_id]['partial_results'] = all_results[-10:]
+        
+        # Run analysis with streaming
+        auto_analysis_sessions[session_id].update({
+            'status': 'processing',
+            'progress': 0,
+            'message': 'Starting TURBO analysis...',
+            'start_time': time.time()
+        })
+        
+        # Run analyzer
+        report = await analyzer.analyze_tar_streaming(
+            str(original_file),
+            callback=stream_callback
+        )
+        
+        # Process results
+        processed_results = process_turbo_results(report, all_results)
+        
+        # Store final results
+        auto_analysis_sessions[session_id].update({
+            'status': 'completed',
+            'progress': 100,
+            'message': 'Analysis complete!',
+            'completed_at': datetime.now().isoformat(),
+            'results': processed_results,
+            'performance': {
+                'total_time': time.time() - auto_analysis_sessions[session_id]['start_time'],
+                'first_result_time': auto_analysis_sessions[session_id].get('first_result_time', 0) - auto_analysis_sessions[session_id]['start_time'],
+                'errors_per_second': len(all_results) / (time.time() - auto_analysis_sessions[session_id]['start_time'])
+            }
+        })
+        
+        print(f"✅ TURBO analysis completed in {auto_analysis_sessions[session_id]['performance']['total_time']:.2f}s")
+        print(f"⚡ First result in {auto_analysis_sessions[session_id]['performance']['first_result_time']:.2f}s")
+        print(f"📊 Processed {auto_analysis_sessions[session_id]['performance']['errors_per_second']:.0f} errors/second")
+        
+    except Exception as e:
+        print(f"❌ TURBO analysis failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        auto_analysis_sessions[session_id].update({
+            'status': 'failed',
+            'error': str(e)
+        })
+
+
+def process_turbo_results(report: Dict, all_results: List[Dict]) -> Dict:
+    """Process turbo analysis results for frontend"""
+    
+    # Build comprehensive results
+    processed = {
+        'total_problems': report['total_errors'],
+        'unique_patterns': report['unique_patterns'],
+        'gitlab_problems': sum(1 for r in all_results if 'monitoring' not in r.get('component', '').lower()),
+        'monitoring_issues': sum(1 for r in all_results if 'monitoring' in r.get('component', '').lower()),
+        
+        # CRITICAL: Full problems array with complete data
+        'problems': [],
+        
+        # Statistics
+        'severity_breakdown': report['errors_by_severity'],
+        'component_stats': report['errors_by_component'],
+        
+        # Metadata
+        'metadata': {
+            'files_processed': report['summary']['files_processed'],
+            'lines_processed': report['summary'].get('lines_processed', 0),
+            'analysis_duration_seconds': report['summary']['end_time'] - report['summary']['start_time'],
+            'turbo_mode': True
+        }
+    }
+    
+    # Process each error group into problems
+    for idx, group in enumerate(report['error_groups']):
+        problem = {
+            'rank': idx + 1,
+            'component': group['component'],
+            'pattern_id': group['pattern_id'],
+            'severity': group['severity'],
+            'count': group['count'],
+            
+            # CRITICAL: Full, clean message - NOT truncated!
+            'message': group['message'],
+            'description': group['message'],  # Duplicate for compatibility
+            
+            # Full samples with complete context
+            'samples': group['samples'],  # Array of full error objects
+            
+            # First sample details (for backward compatibility)
+            'sample_line': group['samples'][0]['full_line'] if group['samples'] else '',
+            'full_context': group['samples'][0].get('full_context', ''),
+            'context_before': group['samples'][0].get('context_before', []),
+            'context_after': group['samples'][0].get('context_after', []),
+            
+            # Metadata
+            'files': group['files'][:10],  # First 10 files
+            'signature': group['signature'],
+            'has_correlation': group['has_correlation'],
+            'has_stack_trace': group['has_stack_trace'],
+            
+            # Additional fields from first sample
+            'correlation_id': group['samples'][0].get('correlation_id') if group['samples'] else None,
+            'request_id': group['samples'][0].get('request_id') if group['samples'] else None,
+            'error_code': group['samples'][0].get('error_code') if group['samples'] else None,
+            'stack_trace': group['samples'][0].get('stack_trace') if group['samples'] else None,
+            'json_fields': group['samples'][0].get('json_fields') if group['samples'] else {},
+            
+            # For monitoring categorization
+            'is_monitoring': 'monitoring' in group['component'].lower()
+        }
+        
+        processed['problems'].append(problem)
+    
+    # Separate monitoring problems
+    processed['monitoring_problems'] = [
+        p for p in processed['problems'] if p['is_monitoring']
+    ]
+    
+    return processed
+
+
+# Add WebSocket endpoint for real-time updates
+@app.websocket("/ws/auto-analysis/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket for real-time analysis updates"""
+    await websocket.accept()
+    websocket_connections[session_id].add(websocket)
+    
+    try:
+        # Send current state immediately
+        state = await AnalysisStateManager.load_state(session_id)
+        if state:
+            await websocket.send_json(state)
+        elif session_id in auto_analysis_sessions:
+            await websocket.send_json(auto_analysis_sessions[session_id])
+        
+        # Keep connection alive
+        while True:
+            await asyncio.sleep(30)  # Ping every 30s
+            await websocket.send_json({"type": "ping"})
+            
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        websocket_connections[session_id].discard(websocket)
 
 
 if __name__ == "__main__":
