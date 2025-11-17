@@ -12,6 +12,8 @@ import asyncio
 import json
 import tarfile
 import zipfile
+import gzip
+import zlib
 import os
 import socket
 import sys
@@ -1882,6 +1884,9 @@ class EnhancedAnalyzer:
             if not Path(f['relative_path']).name.startswith('._')
         ]
         
+        # SURGICAL ENHANCEMENT: Handle daemontools/multilog rotated logs
+        extracted_info = self._process_rotated_logs(extracted_info, extract_dir)
+        
         # RECURSIVE EXTRACTION: Check for nested archives
         nested_archives = []
         archive_extensions = {'.tar', '.tar.gz', '.tgz', '.zip'}
@@ -1955,6 +1960,202 @@ class EnhancedAnalyzer:
             extracted_info.extend(nested_files)
         
         return extracted_info
+    
+    def _process_rotated_logs(self, extracted_info: list, extract_dir: Path) -> list:
+        """
+        Process daemontools/multilog rotated log files (@*.s and @*.u files)
+        Decompress them and save as numbered files for easy browsing
+        """
+        processed_files = []
+        rotated_logs_by_dir = {}  # Group rotated logs by directory
+        files_to_remove = []  # Track compressed files to remove
+        
+        # First pass: identify and group files
+        for file_info in extracted_info:
+            file_path = Path(file_info['full_path'])
+            filename = file_path.name
+            
+            # Check if this is a daemontools rotated log
+            if filename.startswith('@') and (filename.endswith('.s') or filename.endswith('.u')):
+                parent_dir = file_path.parent
+                if parent_dir not in rotated_logs_by_dir:
+                    rotated_logs_by_dir[parent_dir] = []
+                rotated_logs_by_dir[parent_dir].append(file_info)
+                files_to_remove.append(file_info)  # Mark for removal from list
+            else:
+                processed_files.append(file_info)
+        
+        # Process each directory's rotated logs
+        for parent_dir, rotated_files in rotated_logs_by_dir.items():
+            if not rotated_files:
+                continue
+                
+            # Sort by filename (which contains timestamp)
+            rotated_files.sort(key=lambda x: Path(x['full_path']).name)
+            
+            # Get base name from parent directory
+            service_name = parent_dir.name  # e.g., 'gitaly', 'sidekiq'
+            
+            print(f"📦 Processing {len(rotated_files)} rotated logs in {service_name}/")
+            
+            # Process each rotated file
+            for idx, rotated_file in enumerate(rotated_files, 1):
+                original_path = Path(rotated_file['full_path'])
+                
+                try:
+                    # Decompress the content
+                    decompressed_lines = self._decompress_rotated_log(original_path)
+                    
+                    if decompressed_lines:
+                        # Create new filename: current.1.log, current.2.log, etc.
+                        # Or gitaly.1.log, gitaly.2.log if no current file exists
+                        if (parent_dir / 'current').exists():
+                            new_filename = f'current.{idx:03d}.log'
+                        else:
+                            new_filename = f'{service_name}.{idx:03d}.log'
+                        
+                        new_path = parent_dir / new_filename
+                        
+                        # Write decompressed content
+                        with open(new_path, 'w', encoding='utf-8', errors='ignore') as f:
+                            f.writelines(decompressed_lines)
+                        
+                        # Add to processed files list
+                        processed_files.append({
+                            'relative_path': str(new_path.relative_to(extract_dir)),
+                            'full_path': new_path,
+                            'size': new_path.stat().st_size
+                        })
+                        
+                        # Extract timestamp from original filename for logging
+                        timestamp = self._extract_tai64n_timestamp(original_path.name)
+                        print(f"  ✅ {original_path.name} → {new_filename} ({len(decompressed_lines)} lines, {timestamp})")
+                        
+                        # Delete the compressed file to save space
+                        try:
+                            original_path.unlink()
+                        except Exception as e:
+                            print(f"  ⚠️ Could not delete {original_path.name}: {e}")
+                            
+                except Exception as e:
+                    print(f"  ❌ Failed to process {original_path.name}: {e}")
+                    # If decompression fails, keep the original file
+                    processed_files.append(rotated_file)
+        
+        return processed_files
+    
+    def _decompress_rotated_log(self, file_path: Path) -> list:
+        """
+        Decompress a daemontools/multilog rotated log file
+        Returns list of lines with TAI64N timestamps converted to readable format
+        """
+        lines = []
+        
+        try:
+            # Try to decompress as gzip first
+            with gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    # Convert TAI64N timestamp if present
+                    processed_line = self._convert_tai64n_line(line)
+                    lines.append(processed_line)
+        
+        except gzip.BadGzipFile:
+            # Not gzip, could be compressed with another method or plain text
+            # First try reading as binary and attempting decompression
+            try:
+                with open(file_path, 'rb') as f:
+                    raw_content = f.read()
+                
+                # Check if it might be zlib compressed (no gzip header)
+                if len(raw_content) >= 2 and (raw_content[:2] == b'\x78\x9c' or raw_content[:2] == b'\x78\x01'):
+                    try:
+                        decompressed = zlib.decompress(raw_content)
+                        for line in decompressed.decode('utf-8', errors='ignore').splitlines(keepends=True):
+                            processed_line = self._convert_tai64n_line(line)
+                            lines.append(processed_line)
+                    except:
+                        # zlib decompression failed, try other methods
+                        pass
+                
+                # Try multiple decompression methods
+                if not lines:
+                    for decompress_func in [gzip.decompress, zlib.decompress]:
+                        try:
+                            decompressed = decompress_func(raw_content)
+                            for line in decompressed.decode('utf-8', errors='ignore').splitlines(keepends=True):
+                                processed_line = self._convert_tai64n_line(line)
+                                lines.append(processed_line)
+                            break
+                        except:
+                            continue
+                
+                # If still no lines, try reading as plain text
+                if not lines:
+                    try:
+                        content = raw_content.decode('utf-8', errors='ignore')
+                        for line in content.splitlines(keepends=True):
+                            processed_line = self._convert_tai64n_line(line)
+                            lines.append(processed_line)
+                    except:
+                        pass
+                            
+            except Exception as e:
+                print(f"    Could not decompress: {e}")
+                # Last resort: try reading as plain text
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        for line in f:
+                            processed_line = self._convert_tai64n_line(line)
+                            lines.append(processed_line)
+                except:
+                    pass
+        
+        return lines
+    
+    def _convert_tai64n_line(self, line: str) -> str:
+        """
+        Convert TAI64N timestamp at beginning of line to readable format
+        TAI64N format: @4000000069151465074de55c
+        """
+        if line.startswith('@') and len(line) > 25:
+            try:
+                # Extract TAI64N timestamp (25 chars including @)
+                tai64n = line[:25]
+                rest_of_line = line[25:].lstrip()
+                
+                # Parse TAI64N
+                hex_timestamp = tai64n[1:17]  # Skip @ and take 16 hex chars
+                # TAI64 offset: 2^62 + 10 seconds
+                seconds = int(hex_timestamp, 16) - 0x4000000000000000 - 10
+                
+                # Convert to datetime
+                from datetime import datetime
+                dt = datetime.fromtimestamp(seconds)
+                readable_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                return f"[{readable_time}] {rest_of_line}"
+                
+            except Exception:
+                # If conversion fails, return line as-is
+                return line
+        
+        return line
+    
+    def _extract_tai64n_timestamp(self, filename: str) -> str:
+        """
+        Extract and convert TAI64N timestamp from filename
+        Example: @4000000069151465074de55c.s -> 2024-11-13 11:59:37
+        """
+        try:
+            if filename.startswith('@') and len(filename) > 16:
+                hex_timestamp = filename[1:17]
+                seconds = int(hex_timestamp, 16) - 0x4000000000000000 - 10
+                from datetime import datetime
+                dt = datetime.fromtimestamp(seconds)
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+        except:
+            pass
+        return "unknown time"
     
     def _identify_service(self, path: str) -> str:
         """Identify GitLab service from path"""
@@ -2640,6 +2841,7 @@ async def power_search_logs(request: dict):
     limit = request.get('limit', 100)
     context_lines = request.get('context_lines', 0)
     stream = request.get('stream', True)
+    use_optimized = request.get('optimized', False)
     
     if not session_id:
         raise HTTPException(400, "Session ID required")
@@ -2670,14 +2872,30 @@ async def power_search_logs(request: dict):
     async def generate_results():
         """Generate search results as JSON stream"""
         try:
+            # Use optimized engine for large searches
+            if use_optimized and limit > 1000:
+                from power_search_engine import PowerSearchEngineOptimized
+                engine = PowerSearchEngineOptimized(max_workers=4)
+                # Use parallel search for better performance
+                search_gen = engine.search_parallel(
+                    session_id=session_id,
+                    query=query,
+                    files=log_files,
+                    limit=limit,
+                    context_lines=context_lines
+                )
+            else:
+                # Use standard search
+                search_gen = power_search.search(
+                    session_id=session_id,
+                    query=query,
+                    files=log_files,
+                    limit=limit,
+                    context_lines=context_lines
+                )
+            
             # Execute search
-            for result in power_search.search(
-                session_id=session_id,
-                query=query,
-                files=log_files,
-                limit=limit,
-                context_lines=context_lines
-            ):
+            for result in search_gen:
                 # Yield each result as JSON line
                 yield json.dumps(result) + '\n'
                 

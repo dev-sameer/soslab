@@ -23,6 +23,32 @@ const resultsReducer = (state, action) => {
     }
 };
 
+// Optimized batch settings
+const OPTIMIZED_BATCH_SIZE = 200; // Increased from 50
+const OPTIMIZED_BATCH_TIMEOUT = 50; // Decreased from 100ms for faster initial render
+const MAX_RENDERED_RESULTS = 5000; // Limit DOM nodes for performance
+const VIRTUALIZATION_THRESHOLD = 50; // Start virtualizing earlier
+
+// Optimized results reducer with memory management
+const optimizedResultsReducer = (state, action) => {
+    switch (action.type) {
+        case 'ADD_BATCH':
+            // Limit total results in memory
+            const newResults = [...state, ...action.payload];
+            if (newResults.length > MAX_RENDERED_RESULTS) {
+                // Keep only the most recent results
+                return newResults.slice(-MAX_RENDERED_RESULTS);
+            }
+            return newResults;
+        case 'RESET':
+            return [];
+        case 'SET_ALL':
+            return action.payload.slice(0, MAX_RENDERED_RESULTS);
+        default:
+            return state;
+    }
+};
+
 // Cache for parsed JSON content
 const parsedContentCache = new WeakMap();
 
@@ -1603,6 +1629,142 @@ const VirtualizedJsonResults = React.memo(({ results, allExpanded, onCopy }) => 
     );
 });
 
+// Memoized log entry renderer for performance
+const OptimizedLogEntry = React.memo(({ result, onCopy }) => {
+    const [expanded, setExpanded] = useState(false);
+    
+    // Lazy parse JSON only when expanded
+    const parsedContent = useMemo(() => {
+        if (!expanded) return null;
+        
+        try {
+            if (typeof result.content === 'string' && result.content.trim().startsWith('{')) {
+                return JSON.parse(result.content);
+            }
+        } catch (e) {
+            // Ignore parse errors
+        }
+        return null;
+    }, [expanded, result.content]);
+    
+    const severity = useMemo(() => {
+        const content = String(result.content).toLowerCase();
+        if (/\berror\b|exception|fail/i.test(content)) return 'error';
+        if (/\bwarn/i.test(content)) return 'warning';
+        return 'info';
+    }, [result.content]);
+    
+    const severityColor = severity === 'error' ? '#ef4444' : 
+                          severity === 'warning' ? '#f59e0b' : '#3b82f6';
+    
+    return (
+        <div className="mb-4 pl-4" style={{ borderLeft: `3px solid ${severityColor}` }}>
+            <div className="flex items-center gap-2 mb-1 text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                <span>{result.file?.split('/').pop()}</span>
+                <span>Line {result.line_number}</span>
+                <button
+                    onClick={() => setExpanded(!expanded)}
+                    className="ml-auto px-2 py-0.5 rounded text-xs"
+                    style={{
+                        background: 'var(--bg-tertiary)',
+                        color: 'var(--text-secondary)'
+                    }}
+                >
+                    {expanded ? 'Collapse' : 'Expand'}
+                </button>
+                <button onClick={() => onCopy(result)} className="px-2 py-0.5 rounded text-xs">
+                    Copy
+                </button>
+            </div>
+            
+            <div className="font-mono text-sm" style={{ color: severityColor }}>
+                {expanded && parsedContent ? (
+                    <pre className="whitespace-pre-wrap">
+                        {JSON.stringify(parsedContent, null, 2)}
+                    </pre>
+                ) : (
+                    <div className="whitespace-pre-wrap break-all">
+                        {result.content.length > 500 && !expanded 
+                            ? result.content.substring(0, 500) + '...'
+                            : result.content
+                        }
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}, (prevProps, nextProps) => {
+    // Custom comparison for better memoization
+    return prevProps.result.file === nextProps.result.file &&
+           prevProps.result.line_number === nextProps.result.line_number &&
+           prevProps.result.content === nextProps.result.content;
+});
+
+// Virtual scroll component for large result sets
+const VirtualScrollResults = React.memo(({ results, onCopy }) => {
+    const containerRef = useRef(null);
+    const [visibleRange, setVisibleRange] = useState({ start: 0, end: 100 });
+    const itemHeight = 100; // Approximate height of each item
+    const buffer = 20; // Items to render outside viewport
+    
+    useEffect(() => {
+        const container = containerRef.current;
+        if (!container) return;
+        
+        const handleScroll = () => {
+            const scrollTop = container.scrollTop;
+            const containerHeight = container.clientHeight;
+            
+            const start = Math.max(0, Math.floor(scrollTop / itemHeight) - buffer);
+            const end = Math.min(
+                results.length,
+                Math.ceil((scrollTop + containerHeight) / itemHeight) + buffer
+            );
+            
+            setVisibleRange({ start, end });
+        };
+        
+        // Debounce scroll handler
+        let scrollTimeout;
+        const debouncedScroll = () => {
+            clearTimeout(scrollTimeout);
+            scrollTimeout = setTimeout(handleScroll, 16); // ~60fps
+        };
+        
+        container.addEventListener('scroll', debouncedScroll, { passive: true });
+        handleScroll(); // Initial calculation
+        
+        return () => {
+            container.removeEventListener('scroll', debouncedScroll);
+            clearTimeout(scrollTimeout);
+        };
+    }, [results.length, itemHeight, buffer]);
+    
+    const visibleResults = results.slice(visibleRange.start, visibleRange.end);
+    const totalHeight = results.length * itemHeight;
+    const offsetY = visibleRange.start * itemHeight;
+    
+    return (
+        <div 
+            ref={containerRef}
+            className="h-full overflow-y-auto"
+            style={{ position: 'relative' }}
+        >
+            <div style={{ height: totalHeight, position: 'relative' }}>
+                <div style={{ transform: `translateY(${offsetY}px)` }}>
+                    {visibleResults.map((result, idx) => (
+                        <OptimizedLogEntry
+                            key={`${result.file}-${result.line_number}-${visibleRange.start + idx}`}
+                            result={result}
+                            onCopy={onCopy}
+                        />
+                    ))}
+                </div>
+            </div>
+        </div>
+    );
+});
+
 // Main PowerSearch Component
 const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQuery }) => {
     const [query, setQuery] = useState(initialQuery || '');
@@ -1623,13 +1785,23 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
     const [showHistogram, setShowHistogram] = useState(true);
     const [showQueryHelp, setShowQueryHelp] = useState(false);
     const [showSidebar, setShowSidebar] = useState(true);
+    const [useOptimized, setUseOptimized] = useState(false);
+    const [totalResultsFound, setTotalResultsFound] = useState(0);
     const abortControllerRef = useRef(null);
     const resultBatchRef = useRef([]);
     const batchTimeoutRef = useRef(null);
+    const searchStatsRef = useRef({ startTime: 0, bytesProcessed: 0 });
 
-    // Constants
-    const BATCH_SIZE = 50;
-    const BATCH_TIMEOUT = 100; // ms
+    // Auto-enable optimization for large searches
+    useEffect(() => {
+        if (resultLimit > 1000 || (analysisData?.total_lines && analysisData.total_lines > 100000)) {
+            setUseOptimized(true);
+        }
+    }, [resultLimit, analysisData]);
+
+    // Constants - use optimized values when enabled
+    const BATCH_SIZE = useOptimized ? OPTIMIZED_BATCH_SIZE : 50;
+    const BATCH_TIMEOUT = useOptimized ? OPTIMIZED_BATCH_TIMEOUT : 100; // ms
 
     // Define GitLab services based on official docs
     const GITLAB_SERVICES = new Set([
@@ -1763,7 +1935,9 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
 
         setLoading(true);
         dispatchResults({ type: 'RESET' });
+        setTotalResultsFound(0);
         resultBatchRef.current = [];
+        searchStatsRef.current.startTime = Date.now();
 
         // Build query from filters and text
         const fullQuery = buildQueryString();
@@ -1799,24 +1973,29 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
                         session_id: node.sessionId,
                         query: enhancedQuery,
                         limit: resultLimit,
-                        context_lines: contextLines,
+                        context_lines: useOptimized ? 0 : contextLines, // Disabled for performance when optimized
                         stream: true,
-                        gitlab_only: gitlabLogsOnly
+                        gitlab_only: gitlabLogsOnly,
+                        optimized: useOptimized // Add optimization flag
                     }),
                     signal: abortControllerRef.current.signal
                 });
 
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
+                let buffer = '';
 
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
 
-                    const chunk = decoder.decode(value);
-                    const lines = chunk.split('\n').filter(line => line.trim());
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || ''; // Keep incomplete line
 
                     for (const line of lines) {
+                        if (!line.trim()) continue;
+
                         try {
                             const result = JSON.parse(line);
 
@@ -1837,7 +2016,9 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
 
                             // Batch results
                             resultBatchRef.current.push(safeResult);
+                            setTotalResultsFound(prev => prev + 1);
 
+                            // Process batch when it reaches size or set timeout
                             if (resultBatchRef.current.length >= BATCH_SIZE) {
                                 addResultBatch();
                             } else if (!batchTimeoutRef.current) {
@@ -1851,10 +2032,29 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
                         }
                     }
                 }
+
+                // Process remaining buffer
+                if (buffer.trim()) {
+                    try {
+                        const result = JSON.parse(buffer);
+                        resultBatchRef.current.push({
+                            ...result,
+                            nodeId: node.id,
+                            nodeName: node.name,
+                            _timestamp: Date.now()
+                        });
+                        setTotalResultsFound(prev => prev + 1);
+                    } catch (e) {
+                        console.warn('PowerSearch: Failed to parse final buffer:', e);
+                    }
+                }
             }
 
             // Flush any remaining results
             addResultBatch();
+            
+            const elapsed = Date.now() - searchStatsRef.current.startTime;
+            console.log(`Search completed in ${elapsed}ms, found ${totalResultsFound} results`);
         } catch (error) {
             if (error.name !== 'AbortError') {
                 console.error('Search failed:', error);
@@ -2093,7 +2293,7 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
                             {loading ? (
                                 <>
                                     <div className="animate-spin w-3 h-3 border-2 border-current border-t-transparent rounded-full" />
-                                    Searching...
+                                    Searching... ({totalResultsFound})
                                 </>
                             ) : (
                                 <>
@@ -2103,6 +2303,19 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
                             )}
                         </button>
                     </div>
+                    
+                    {/* Performance warning */}
+                    {totalResultsFound > 10000 && (
+                        <div className="mt-2 p-2 rounded flex items-center gap-2" style={{
+                            background: '#fef3c7',
+                            color: '#92400e'
+                        }}>
+                            <AlertCircle className="w-4 h-4" />
+                            <span className="text-sm">
+                                Large dataset detected. Showing first {MAX_RENDERED_RESULTS} results for performance.
+                            </span>
+                        </div>
+                    )}
 
                     {/* Query Help */}
                     {showQueryHelp && (
@@ -2516,8 +2729,9 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
                             {!loading && results.length > 0 && (
                                 <div className="px-4 pt-4 pb-2 flex items-center justify-between">
                                     <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                                        {results.length} results
+                                        Showing {results.length} of {totalResultsFound} results
                                         {results.length >= resultLimit && ' (limit reached)'}
+                                        {results.length > VIRTUALIZATION_THRESHOLD && ' (virtualized for performance)'}
                                     </span>
                                     {viewMode === 'json' && (
                                         <button
@@ -2555,16 +2769,23 @@ const PowerSearch = ({ sessionId, analysisData, nodes, currentNodeId, initialQue
                                         />
                                     </div>
                                 ) : (
-                                    // Enhanced view with more visible fields
-                                    <div className="space-y-4 overflow-y-auto h-full">
-                                        {results.map((result, idx) => (
-                                            <EnhancedLogEntry
-                                                key={`${idx}-${result.line_number}-${result.file}`}
-                                                result={result}
-                                                onCopy={copyResult}
-                                            />
-                                        ))}
-                                    </div>
+                                    // Enhanced view with virtualization for large result sets
+                                    (() => {
+                                        const shouldVirtualize = results.length > VIRTUALIZATION_THRESHOLD;
+                                        return shouldVirtualize ? (
+                                            <VirtualScrollResults results={results} onCopy={copyResult} />
+                                        ) : (
+                                            <div className="space-y-4 overflow-y-auto h-full">
+                                                {results.map((result, idx) => (
+                                                    <EnhancedLogEntry
+                                                        key={`${idx}-${result.line_number}-${result.file}`}
+                                                        result={result}
+                                                        onCopy={copyResult}
+                                                    />
+                                                ))}
+                                            </div>
+                                        );
+                                    })()
                                 )}
                             </div>
                         </div>
