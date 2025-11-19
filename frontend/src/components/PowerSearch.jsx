@@ -1642,7 +1642,7 @@ const OptimizedLogEntry = React.memo(({ result, onCopy }) => {
                 return JSON.parse(result.content);
             }
         } catch (e) {
-            // Ignore parse errors
+            console.warn('Failed to parse log content as JSON:', e.message, result.content.substring(0, 100));
         }
         return null;
     }, [expanded, result.content]);
