@@ -189,6 +189,7 @@ try:
     import numpy
     import uvicorn
     import websockets
+    import psutil
     print("OK")
 except ImportError as e:
     print(f"MISSING:{e.name if hasattr(e, 'name') else str(e)}")
@@ -297,7 +298,8 @@ except Exception as e:
             "websockets==12.0",
             numpy_spec,  # Dynamic numpy version
             pandas_spec,  # Dynamic pandas version
-            "python-dotenv"
+            "python-dotenv",
+            "psutil==5.9.6"  # Memory monitoring for performance optimizations
         ]
         
         # Install packages with progress
