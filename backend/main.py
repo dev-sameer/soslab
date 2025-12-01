@@ -43,6 +43,8 @@ import aiofiles
 import uuid
 from asyncio import create_task, Queue
 
+from upload import router
+
 try:
     from fast_stats_service import FastStatsService
 except ImportError:
@@ -2436,40 +2438,6 @@ def safe_restore_sessions():
         print(f"⚠️ Session restoration check failed (non-critical): {e}")
         # Don't crash - this is just a recovery attempt
 
-
-@app.post("/api/upload")
-async def upload_sos(
-    background_tasks: BackgroundTasks,
-    file: UploadFile
-):
-    """Handle SOS file upload"""
-    
-    if not file.filename.endswith(('.tar', '.tar.gz', '.tgz', '.zip')):
-        raise HTTPException(400, "Invalid file format")
-    
-    session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
-    
-    # Save uploaded file
-    upload_path = Path("data/uploads")
-    upload_path.mkdir(parents=True, exist_ok=True)
-    
-    file_path = upload_path / f"{session_id}_{file.filename}"
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
-    
-    # Start analysis in background
-    background_tasks.add_task(
-        analyze_sos_task,
-        session_id,
-        file_path
-    )
-    
-    return {
-        "session_id": session_id,
-        "status": "processing",
-        "message": "Analysis started"
-    }
 
 async def analyze_sos_task(session_id: str, file_path: Path):
     """Background task to analyze SOS"""
@@ -5197,6 +5165,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     finally:
         websocket_connections[session_id].discard(websocket)
 
+app.include_router(router.router)
 
 if __name__ == "__main__":
     ensure_localhost_only()
