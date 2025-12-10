@@ -428,15 +428,34 @@ except Exception as e:
         
         # Setup frontend if exists
         if Path("frontend").exists():
-            if not Path("frontend/node_modules").exists() or self.force_reinstall:
+            # Check if node_modules is valid by looking for key packages
+            node_modules_valid = False
+            if Path("frontend/node_modules").exists():
+                # Verify critical packages exist
+                critical_packages = ["react", "vite", "xterm"]
+                node_modules_valid = all(
+                    Path(f"frontend/node_modules/{pkg}").exists() 
+                    for pkg in critical_packages
+                )
+            
+            if not node_modules_valid or self.force_reinstall:
                 print("📦 Installing frontend packages...")
                 try:
+                    # Clean install if corrupted
+                    if not node_modules_valid and Path("frontend/node_modules").exists():
+                        self.log_debug("Cleaning corrupted node_modules...")
+                        shutil.rmtree("frontend/node_modules", ignore_errors=True)
+                    
                     if self.debug:
-                        subprocess.run(["npm", "install"], cwd="frontend")
+                        result = subprocess.run(["npm", "install"], cwd="frontend")
                     else:
-                        subprocess.run(["npm", "install"], cwd="frontend", 
+                        result = subprocess.run(["npm", "install"], cwd="frontend", 
                                      capture_output=True)
-                    print("   ✅ Frontend packages installed")
+                    
+                    if result.returncode == 0:
+                        print("   ✅ Frontend packages installed")
+                    else:
+                        print("   ⚠️ Frontend npm install had issues, continuing...")
                 except Exception as e:
                     print(f"   ⚠️ Frontend setup failed: {e}")
             else:
