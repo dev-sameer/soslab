@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { 
+import {
     Search, Upload, FileText, AlertCircle, CheckCircle, Trash2,
     Download, Filter, ChevronRight, ChevronDown, Activity, Package,
     AlertTriangle, BarChart3, Clock, TrendingUp, Zap, Eye,
     ChevronLeft, ChevronUp, X, Maximize2, Minimize2, Plus, Server,
-    Sparkles, Bot, Layers, Hash, Info, MessageCircle, Sun, Moon
+    Sparkles, Bot, Layers, Hash, Info, MessageCircle, Sun, Moon, FilePlus, Terminal, GitBranch
 } from 'lucide-react';
 import PowerSearch from './components/PowerSearch';
 import DuoChatWidget from './components/DuoChatWidget';
@@ -12,6 +12,10 @@ import FastStatsDashboard from './components/FastStatsDashboard';
 import AutoAnalysis from './components/AutoAnalysis';
 import SystemMetrics from './components/SystemMetrics';
 import EnhancedLogViewer from './components/EnhancedLogViewer';
+import TerminalPanel from './components/TerminalPanel';
+import TroubleshootingSlate from './components/TroubleshootingSlate';
+import LogGrep from './components/LogGrepRevamped';
+import RequestChainTracer from './components/RequestChainTracer';
 
 
 
@@ -44,6 +48,13 @@ const injectCustomStyles = () => {
                 --border-secondary: #d1d5db;
                 --hover-bg: #f3f4f6;
                 --accent: #111827;
+                
+                /* Tab-specific colors for differentiation */
+                --tab-bg: #f5f5f5;
+                --tab-bg-hover: #ebebeb;
+                --tab-bg-active: #ffffff;
+                --tab-border: #d4d4d8;
+                --tab-separator: #e4e4e7;
             }
             
             [data-theme="dark"] {
@@ -57,6 +68,13 @@ const injectCustomStyles = () => {
                 --border-secondary: #3f3f46;
                 --hover-bg: #18181b;
                 --accent: #ffffff;
+                
+                /* Tab-specific colors for dark mode */
+                --tab-bg: #1a1a1a;
+                --tab-bg-hover: #252525;
+                --tab-bg-active: #000000;
+                --tab-border: #3a3a3a;
+                --tab-separator: #2a2a2a;
             }
             
             /* Scrollbar */
@@ -210,7 +228,7 @@ const EnhancedSearch = ({ sessionId, onNavigateToLog }) => {
 
     const handleSearch = async () => {
         if (!query.trim()) return;
-        
+
         setLoading(true);
         try {
             const response = await fetch('/api/search', {
@@ -246,15 +264,14 @@ const EnhancedSearch = ({ sessionId, onNavigateToLog }) => {
                     </div>
                     Smart Log Search
                 </h2>
-                
+
                 <div className="flex gap-3 mb-4">
                     {['semantic', 'exact', 'regex'].map((type) => (
                         <button
                             key={type}
                             onClick={() => setSearchType(type)}
-                            className={`px-5 py-2.5 rounded-xl text-sm font-semibold smooth-transition ${
-                                searchType === type ? 'btn-primary' : 'btn-secondary'
-                            }`}
+                            className={`px-5 py-2.5 rounded-xl text-sm font-semibold smooth-transition ${searchType === type ? 'btn-primary' : 'btn-secondary'
+                                }`}
                         >
                             {type === 'semantic' && <Zap className="w-4 h-4 inline mr-2" />}
                             {type.charAt(0).toUpperCase() + type.slice(1)}
@@ -268,11 +285,11 @@ const EnhancedSearch = ({ sessionId, onNavigateToLog }) => {
                         <input
                             type="text"
                             placeholder={
-                                searchType === 'semantic' 
+                                searchType === 'semantic'
                                     ? "Search for concepts (e.g., 'authentication errors', 'database timeouts')"
                                     : searchType === 'regex'
-                                    ? "Enter regex pattern..."
-                                    : "Enter exact text to search..."
+                                        ? "Enter regex pattern..."
+                                        : "Enter exact text to search..."
                             }
                             className="w-full pl-12 pr-4 py-3 rounded-xl focus:outline-none focus:ring-2 focus:ring-current smooth-transition"
                             style={{
@@ -303,7 +320,7 @@ const EnhancedSearch = ({ sessionId, onNavigateToLog }) => {
                         <select
                             key={filterType}
                             value={filters[filterType]}
-                            onChange={(e) => setFilters({...filters, [filterType]: e.target.value})}
+                            onChange={(e) => setFilters({ ...filters, [filterType]: e.target.value })}
                             className="px-4 py-2 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-current"
                             style={{
                                 background: 'var(--bg-primary)',
@@ -354,11 +371,10 @@ const EnhancedSearch = ({ sessionId, onNavigateToLog }) => {
                         >
                             <div className="flex items-start justify-between mb-3">
                                 <div className="flex items-center gap-3">
-                                    <span className={`px-3 py-1 text-xs rounded-full font-semibold ${
-                                        result.metadata?.severity === 'error' ? 'bg-red-500 text-white' :
+                                    <span className={`px-3 py-1 text-xs rounded-full font-semibold ${result.metadata?.severity === 'error' ? 'bg-red-500 text-white' :
                                         result.metadata?.severity === 'warning' ? 'bg-yellow-500 text-black' :
-                                        'bg-gray-500 text-white'
-                                    }`}>
+                                            'bg-gray-500 text-white'
+                                        }`}>
                                         {result.metadata?.severity || 'info'}
                                     </span>
                                     <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>{result.file}</span>
@@ -366,8 +382,8 @@ const EnhancedSearch = ({ sessionId, onNavigateToLog }) => {
                                 </div>
                                 <Eye className="w-4 h-4" style={{ color: 'var(--text-tertiary)' }} />
                             </div>
-                            <code className="font-mono text-sm break-all line-clamp-2 p-3 rounded-lg" 
-                                style={{ 
+                            <code className="font-mono text-sm break-all line-clamp-2 p-3 rounded-lg"
+                                style={{
                                     background: 'var(--bg-tertiary)',
                                     color: 'var(--text-primary)'
                                 }}>
@@ -396,7 +412,7 @@ const EnhancedSearch = ({ sessionId, onNavigateToLog }) => {
 const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
     const [selectedTab, setSelectedTab] = useState('overview');
     const [selectedPattern, setSelectedPattern] = useState(null);
-    
+
     // Detect if this is a KubeSOS archive
     const isKubeSOS = data?.type === 'kubesos';
 
@@ -416,11 +432,10 @@ const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
                         <button
                             key={tab}
                             onClick={() => setSelectedTab(tab)}
-                            className={`px-6 py-4 text-sm font-semibold border-b-3 capitalize smooth-transition ${
-                                selectedTab === tab
-                                    ? 'border-current'
-                                    : 'border-transparent hover:border-gray-300'
-                            }`}
+                            className={`px-6 py-4 text-sm font-semibold border-b-3 capitalize smooth-transition ${selectedTab === tab
+                                ? 'border-current'
+                                : 'border-transparent hover:border-gray-300'
+                                }`}
                             style={{
                                 color: selectedTab === tab ? 'var(--text-primary)' : 'var(--text-secondary)',
                                 borderBottomWidth: '3px'
@@ -476,11 +491,11 @@ const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
                             {[
                                 {
                                     icon: AlertCircle,
-                                    value: isKubeSOS 
+                                    value: isKubeSOS
                                         ? data?.events?.filter(e => e.severity === 'error').length || 0
                                         : Object.values(data?.patterns || {}).filter(p => p.severity === 'error').reduce((sum, p) => sum + p.count, 0),
                                     label: isKubeSOS ? 'Error Events' : 'Total Errors',
-                                    sublabel: isKubeSOS 
+                                    sublabel: isKubeSOS
                                         ? 'Kubernetes error events'
                                         : `Across ${Object.values(data?.patterns || {}).filter(p => p.severity === 'error').length} patterns`,
                                     color: '#ef4444'
@@ -595,12 +610,11 @@ const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
                                             <div className="flex items-start justify-between">
                                                 <div className="flex-1">
                                                     <div className="flex items-center gap-3 mb-2">
-                                                        <span className={`px-3 py-1 text-xs rounded-full font-semibold ${
-                                                            pattern.severity === 'error' ? 'bg-red-500 text-white' :
+                                                        <span className={`px-3 py-1 text-xs rounded-full font-semibold ${pattern.severity === 'error' ? 'bg-red-500 text-white' :
                                                             pattern.severity === 'warning' ? 'bg-yellow-500 text-black' :
-                                                            pattern.severity === 'info' ? 'bg-blue-500 text-white' :
-                                                            'bg-gray-500 text-white'
-                                                        }`}>
+                                                                pattern.severity === 'info' ? 'bg-blue-500 text-white' :
+                                                                    'bg-gray-500 text-white'
+                                                            }`}>
                                                             {pattern.severity}
                                                         </span>
                                                         <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
@@ -646,11 +660,10 @@ const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
                                     >
                                         <div className="flex items-start justify-between mb-2">
                                             <div className="flex items-center gap-3">
-                                                <span className={`px-3 py-1 text-xs rounded-full font-semibold ${
-                                                    event.severity === 'error' ? 'bg-red-500 text-white' :
+                                                <span className={`px-3 py-1 text-xs rounded-full font-semibold ${event.severity === 'error' ? 'bg-red-500 text-white' :
                                                     event.severity === 'warning' ? 'bg-yellow-500 text-black' :
-                                                    'bg-gray-500 text-white'
-                                                }`}>
+                                                        'bg-gray-500 text-white'
+                                                    }`}>
                                                     {event.type || event.severity}
                                                 </span>
                                                 <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
@@ -715,8 +728,8 @@ const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
                                                 {anomaly.file} • Line {anomaly.line_number}
                                             </span>
                                         </div>
-                                        <code className="text-xs font-mono break-all line-clamp-2 p-2 rounded-lg" 
-                                            style={{ 
+                                        <code className="text-xs font-mono break-all line-clamp-2 p-2 rounded-lg"
+                                            style={{
                                                 background: 'var(--bg-tertiary)',
                                                 color: 'var(--text-primary)'
                                             }}>
@@ -751,11 +764,10 @@ const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
                         {(data?.insights || []).map((insight, idx) => (
                             <div
                                 key={idx}
-                                className={`p-6 rounded-xl shadow-minimal border-l-4 ${
-                                    insight.type === 'critical' ? 'border-l-red-500' :
+                                className={`p-6 rounded-xl shadow-minimal border-l-4 ${insight.type === 'critical' ? 'border-l-red-500' :
                                     insight.type === 'warning' ? 'border-l-yellow-500' :
-                                    'border-l-blue-500'
-                                }`}
+                                        'border-l-blue-500'
+                                    }`}
                                 style={{
                                     background: 'var(--bg-secondary)',
                                     border: '1px solid var(--border-primary)',
@@ -763,16 +775,15 @@ const InteractiveAnalysis = ({ data, onNavigateToLog }) => {
                                 }}
                             >
                                 <div className="flex items-start">
-                                    <div className={`p-3 rounded-xl mr-4 ${
-                                        insight.type === 'critical' ? 'bg-red-50' :
+                                    <div className={`p-3 rounded-xl mr-4 ${insight.type === 'critical' ? 'bg-red-50' :
                                         insight.type === 'warning' ? 'bg-yellow-50' :
-                                        'bg-blue-50'
-                                    }`}>
-                                        {insight.type === 'critical' ? 
+                                            'bg-blue-50'
+                                        }`}>
+                                        {insight.type === 'critical' ?
                                             <AlertCircle className="w-6 h-6 text-red-500" /> :
                                             insight.type === 'warning' ?
-                                            <AlertTriangle className="w-6 h-6 text-yellow-500" /> :
-                                            <TrendingUp className="w-6 h-6 text-blue-500" />
+                                                <AlertTriangle className="w-6 h-6 text-yellow-500" /> :
+                                                <TrendingUp className="w-6 h-6 text-blue-500" />
                                         }
                                     </div>
                                     <div className="flex-1">
@@ -1521,8 +1532,125 @@ const EnhancedLogViewer1 = ({ sessionId, analysisData, initialFile, initialLine 
     );
 };
 
+// Custom Session Add Files Component
+const CustomSessionAddFiles = ({ sessionId, onFilesAdded }) => {
+    const [isDragging, setIsDragging] = useState(false);
+    const [uploading, setUploading] = useState(false);
+
+    const handleFiles = async (files) => {
+        if (files.length === 0) return;
+        setUploading(true);
+
+        try {
+            const formData = new FormData();
+            files.forEach(file => formData.append('files', file));
+
+            console.log('🔄 Uploading files to session:', sessionId);
+
+            const response = await fetch(`/api/sessions/${sessionId}/add-files`, {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) throw new Error('Upload failed');
+
+            const result = await response.json();
+            console.log('✅ Files added:', result);
+            console.log('   Files added count:', result.files_added);
+            console.log('   Total files now:', result.total_files);
+
+            // CRITICAL: Fetch the updated analysis data
+            console.log('🔄 Fetching updated analysis...');
+            const analysisResponse = await fetch(`/api/analysis/${sessionId}`);
+            const updatedAnalysis = await analysisResponse.json();
+
+            console.log('📊 Updated analysis received:');
+            console.log('   Total files:', updatedAnalysis.total_files);
+            console.log('   Log files:', Object.keys(updatedAnalysis.log_files || {}));
+
+            // Call the callback with the updated analysis data
+            onFilesAdded(updatedAnalysis);
+
+        } catch (error) {
+            console.error('❌ Upload error:', error);
+            alert('Failed to upload: ' + error.message);
+        } finally {
+            setUploading(false);
+        }
+    };
+
+    return (
+        <div className="h-full flex items-center justify-center p-8" style={{ background: 'var(--bg-primary)' }}>
+            <div
+                onDrop={(e) => {
+                    e.preventDefault();
+                    setIsDragging(false);
+                    handleFiles(Array.from(e.dataTransfer.files));
+                }}
+                onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                onDragLeave={() => setIsDragging(false)}
+                className="w-full max-w-3xl h-96 border-3 border-dashed rounded-2xl flex flex-col items-center justify-center"
+                style={{
+                    borderColor: isDragging ? 'var(--accent)' : 'var(--border-primary)',
+                    background: isDragging ? 'var(--bg-tertiary)' : 'var(--bg-secondary)'
+                }}
+            >
+                <input
+                    type="file"
+                    multiple
+                    onChange={(e) => handleFiles(Array.from(e.target.files || []))}
+                    className="hidden"
+                    id="custom-add-files"
+                    disabled={uploading}
+                />
+
+                {uploading ? (
+                    <div className="text-center">
+                        <div className="animate-spin w-12 h-12 border-4 border-t-transparent rounded-full mx-auto mb-4"
+                            style={{ borderColor: 'var(--accent)', borderTopColor: 'transparent' }} />
+                        <p style={{ color: 'var(--text-primary)' }}>Uploading files...</p>
+                    </div>
+                ) : (
+                    <label htmlFor="custom-add-files" className="text-center cursor-pointer p-8">
+                        <Upload className="w-16 h-16 mx-auto mb-4" style={{ color: 'var(--text-tertiary)' }} />
+                        <h3 className="text-xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
+                            Add Files to Custom Session
+                        </h3>
+                        <p className="mb-4" style={{ color: 'var(--text-secondary)' }}>
+                            Drag & drop log files, configs, or archives
+                        </p>
+                        <div className="flex flex-wrap justify-center gap-2 text-sm">
+                            {['.log', '.json', '.txt', '.tar.gz', '.zip'].map(ext => (
+                                <span key={ext} className="px-2 py-1 rounded-full" style={{
+                                    background: 'var(--bg-tertiary)',
+                                    color: 'var(--text-secondary)'
+                                }}>{ext}</span>
+                            ))}
+                        </div>
+                    </label>
+                )}
+            </div>
+        </div>
+    );
+};
+
 // Enhanced Upload Page with Session Overview
 const EnhancedUploadPage = ({ nodes, onUploadComplete, onNodeSelect, onNodeClose }) => {
+    const [uploadMode, setUploadMode] = useState('sos');
+
+    const handleCreateCustomSession = async () => {
+        try {
+            const response = await fetch('/api/sessions/custom/create', {
+                method: 'POST'
+            });
+            const result = await response.json();
+            onUploadComplete(result);
+        } catch (error) {
+            console.error('Failed to create custom session:', error);
+            alert('Failed to create custom session');
+        }
+    };
+
     return (
         <div className="h-full overflow-y-auto" style={{ background: 'var(--bg-primary)' }}>
             <div className="max-w-7xl mx-auto p-8">
@@ -1554,105 +1682,69 @@ const EnhancedUploadPage = ({ nodes, onUploadComplete, onNodeSelect, onNodeClose
                             {nodes.filter(n => n.status === 'failed').length} failed
                         </div>
                     </div>
-                    
-                    <div className="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-3">
+
+                    <div className="flex flex-wrap gap-2 justify-center">
                         {nodes.map(node => {
                             const isProcessing = node.status === 'processing';
                             const isCompleted = node.status === 'completed';
                             const isFailed = node.status === 'failed';
-                            
+
                             return (
                                 <div
                                     key={node.id}
                                     onClick={() => onNodeSelect(node.id)}
-                                    className="relative p-3 rounded-lg cursor-pointer smooth-transition transform hover:scale-[1.02] hover:shadow-md"
+                                    className="relative flex items-center gap-2 cursor-pointer smooth-transition hover:scale-[1.02]"
                                     style={{
-                                        background: 'var(--bg-secondary)',
-                                        border: '1px solid var(--border-primary)',
-                                        boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                                        background: 'var(--tab-bg)',
+                                        border: '1px solid var(--tab-border)',
+                                        borderRadius: '16px',
+                                        padding: '6px 12px',
+                                        minWidth: '140px',
+                                        maxWidth: '220px'
                                     }}
                                 >
-                                    {/* Status Badge */}
-                                    <div className="absolute top-1.5 right-1.5">
+                                    {/* Node name */}
+                                    <div className="flex-1 min-w-0 flex items-center gap-1.5">
+                                        <div className="truncate text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
+                                            {node.name}
+                                        </div>
+                                        {node.analysisData && (
+                                            <div className="text-xs" style={{ color: 'var(--text-tertiary)', fontSize: '10px' }}>
+                                                • {((node.analysisData.total_lines || 0) / 1000).toFixed(1)}k
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Status icon */}
+                                    <div className="flex-shrink-0">
                                         {isProcessing && (
-                                            <div className="animate-spin w-3 h-3 border border-current border-t-transparent rounded-full" 
-                                                 style={{ color: 'var(--text-tertiary)' }} />
+                                            <div className="animate-spin w-3 h-3 border border-current border-t-transparent rounded-full"
+                                                style={{ color: 'var(--text-tertiary)' }} />
                                         )}
                                         {isCompleted && <CheckCircle className="w-3 h-3 text-green-500" />}
                                         {isFailed && <AlertCircle className="w-3 h-3 text-red-500" />}
                                     </div>
-                                    
-                                    {/* Close Button */}
+
+                                    {/* Close button */}
                                     <button
                                         onClick={(e) => {
                                             e.stopPropagation();
                                             onNodeClose(node.id);
                                         }}
-                                        className="absolute top-1.5 left-1.5 p-0.5 rounded opacity-0 hover:opacity-100 smooth-transition"
-                                        style={{ background: 'var(--bg-primary)' }}
+                                        className="flex-shrink-0 rounded-full opacity-0 hover:opacity-100 smooth-transition"
+                                        style={{
+                                            width: '14px',
+                                            height: '14px',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            background: 'transparent',
+                                            color: 'var(--text-tertiary)'
+                                        }}
                                         title="Close session"
                                     >
-                                        <X className="w-2.5 h-2.5" style={{ color: 'var(--text-tertiary)' }} />
+                                        <X className="w-2.5 h-2.5" />
                                     </button>
-                                    
-                                    <div className="flex items-start gap-2 mb-2 mt-1">
-                                        <div className="p-1.5 rounded flex-shrink-0" style={{ background: 'var(--bg-primary)' }}>
-                                            <Package className="w-3 h-3" style={{ color: 'var(--text-secondary)' }} />
-                                        </div>
-                                        <div className="flex-1 min-w-0">
-                                            <h3 className="font-semibold text-xs truncate" style={{ color: 'var(--text-primary)' }}>
-                                                {node.name}
-                                            </h3>
-                                            <p className="text-xs truncate mt-0.5" style={{ color: 'var(--text-secondary)', fontSize: '10px' }}>
-                                                {node.filename ? (
-                                                    node.filename.length > 15 
-                                                        ? node.filename.substring(0, 12) + '...' 
-                                                        : node.filename
-                                                ) : 'Processing...'}
-                                            </p>
-                                        </div>
-                                    </div>
-                                    
-                                    {/* Status */}
-                                    <div className="mb-2">
-                                        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium ${
-                                            isProcessing ? 'bg-blue-500/20 text-blue-600' :
-                                            isCompleted ? 'bg-green-500/20 text-green-600' :
-                                            isFailed ? 'bg-red-500/20 text-red-600' :
-                                            'bg-gray-500/20 text-gray-600'
-                                        }`} style={{ fontSize: '10px' }}>
-                                            {isProcessing && <div className="animate-spin w-1.5 h-1.5 border border-current border-t-transparent rounded-full mr-1" />}
-                                            {node.status}
-                                        </span>
-                                    </div>
-                                    
-                                    {/* Stats */}
-                                    {node.analysisData && (
-                                        <div className="grid grid-cols-2 gap-1 text-xs">
-                                            <div>
-                                                <p style={{ color: 'var(--text-tertiary)', fontSize: '10px' }}>Files</p>
-                                                <p className="font-semibold text-xs" style={{ color: 'var(--text-primary)' }}>
-                                                    {node.analysisData.files_processed || 0}
-                                                </p>
-                                            </div>
-                                            <div>
-                                                <p style={{ color: 'var(--text-tertiary)', fontSize: '10px' }}>Lines</p>
-                                                <p className="font-semibold text-xs" style={{ color: 'var(--text-primary)' }}>
-                                                    {((node.analysisData.total_lines || 0) / 1000).toFixed(1)}k
-                                                </p>
-                                            </div>
-                                        </div>
-                                    )}
-                                    
-                                    {/* Processing indicator */}
-                                    {isProcessing && (
-                                        <div className="mt-1.5 text-xs" style={{ color: 'var(--text-tertiary)', fontSize: '10px' }}>
-                                            <div className="flex items-center gap-1">
-                                                <div className="w-1 h-1 bg-blue-500 rounded-full animate-pulse" />
-                                                Analyzing...
-                                            </div>
-                                        </div>
-                                    )}
                                 </div>
                             );
                         })}
@@ -1661,17 +1753,89 @@ const EnhancedUploadPage = ({ nodes, onUploadComplete, onNodeSelect, onNodeClose
 
                 {/* Upload New Archive Section */}
                 <div className="border-t pt-8" style={{ borderColor: 'var(--border-primary)' }}>
-                    <div className="text-center mb-6">
-                        <h2 className="text-2xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
-                            Upload New SOS Archive
-                        </h2>
-                        <p style={{ color: 'var(--text-secondary)' }}>
-                            Add another SOS archive to analyze
-                        </p>
+                    <div className="flex justify-center mb-8">
+                        <div className="flex p-1 rounded-xl" style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-primary)' }}>
+                            <button
+                                onClick={() => setUploadMode('sos')}
+                                className={`px-6 py-2 rounded-lg text-sm font-medium smooth-transition flex items-center gap-2 ${uploadMode === 'sos' ? 'shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-800'
+                                    }`}
+                                style={{
+                                    background: uploadMode === 'sos' ? 'var(--bg-primary)' : 'transparent',
+                                    color: uploadMode === 'sos' ? 'var(--text-primary)' : 'var(--text-secondary)'
+                                }}
+                            >
+                                <Upload className="w-4 h-4" />
+                                Upload SOS Bundle
+                            </button>
+                            <button
+                                onClick={() => setUploadMode('custom')}
+                                className={`px-6 py-2 rounded-lg text-sm font-medium smooth-transition flex items-center gap-2 ${uploadMode === 'custom' ? 'shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-800'
+                                    }`}
+                                style={{
+                                    background: uploadMode === 'custom' ? 'var(--bg-primary)' : 'transparent',
+                                    color: uploadMode === 'custom' ? 'var(--text-primary)' : 'var(--text-secondary)'
+                                }}
+                            >
+                                <FilePlus className="w-4 h-4" />
+                                Custom Session
+                            </button>
+                        </div>
                     </div>
-                    
+
                     <div className="max-w-4xl mx-auto">
-                        <CompactFileUploader onUploadComplete={onUploadComplete} />
+                        {uploadMode === 'sos' ? (
+                            <>
+                                <div className="text-center mb-6">
+                                    <h2 className="text-2xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
+                                        Upload New SOS Archive
+                                    </h2>
+                                    <p style={{ color: 'var(--text-secondary)' }}>
+                                        Add another SOS archive to analyze
+                                    </p>
+                                </div>
+                                <CompactFileUploader onUploadComplete={onUploadComplete} />
+                            </>
+                        ) : (
+                            <div className="text-center">
+                                <div className="mb-6">
+                                    <h2 className="text-2xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
+                                        Start Custom Session
+                                    </h2>
+                                    <p style={{ color: 'var(--text-secondary)' }}>
+                                        Create an empty session and add files manually
+                                    </p>
+                                </div>
+
+                                <div
+                                    className="p-12 rounded-xl border-2 border-dashed smooth-transition flex flex-col items-center justify-center cursor-pointer group"
+                                    style={{
+                                        borderColor: 'var(--border-secondary)',
+                                        background: 'var(--bg-secondary)'
+                                    }}
+                                    onClick={handleCreateCustomSession}
+                                >
+                                    <div className="p-4 rounded-full mb-4 group-hover:scale-110 smooth-transition"
+                                        style={{ background: 'var(--bg-tertiary)' }}>
+                                        <FilePlus className="w-8 h-8" style={{ color: 'var(--text-primary)' }} />
+                                    </div>
+                                    <h3 className="text-lg font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>
+                                        Create Empty Session
+                                    </h3>
+                                    <p className="text-sm max-w-sm mx-auto mb-6" style={{ color: 'var(--text-secondary)' }}>
+                                        Start with a clean slate and add individual log files or archives later.
+                                    </p>
+                                    <button
+                                        className="px-6 py-2 rounded-lg font-medium smooth-transition"
+                                        style={{
+                                            background: 'var(--accent)',
+                                            color: 'var(--bg-primary)'
+                                        }}
+                                    >
+                                        Create Session
+                                    </button>
+                                </div>
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>
@@ -1690,12 +1854,12 @@ const CompactFileUploader = ({ onUploadComplete }) => {
     const handleDrop = async (e) => {
         e.preventDefault();
         setIsDragging(false);
-        
+
         const files = Array.from(e.dataTransfer.files);
-        const validFiles = files.filter(file => 
+        const validFiles = files.filter(file =>
             file.name.match(/\.(tar|tar\.gz|tgz|zip)$/)
         );
-        
+
         if (validFiles.length === 0) {
             alert('Please upload valid SOS archives (.tar, .tar.gz, .zip)');
             return;
@@ -1711,11 +1875,11 @@ const CompactFileUploader = ({ onUploadComplete }) => {
     const handleMultipleUploads = async (files) => {
         setUploading(true);
         setUploadQueue(files.map(f => f.name));
-        
+
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             setCurrentUpload(file.name);
-            
+
             try {
                 await handleUpload(file, i === files.length - 1);
                 if (i < files.length - 1) {
@@ -1725,7 +1889,7 @@ const CompactFileUploader = ({ onUploadComplete }) => {
                 console.error(`Failed to upload ${file.name}:`, error);
             }
         }
-        
+
         setUploadQueue([]);
         setCurrentUpload(null);
         setUploading(false);
@@ -1741,7 +1905,7 @@ const CompactFileUploader = ({ onUploadComplete }) => {
         if (!uploadQueue.length) {
             setUploading(true);
         }
-        
+
         setUploadProgress(prev => ({ ...prev, [file.name]: 0 }));
 
         const progressInterval = setInterval(() => {
@@ -1754,33 +1918,33 @@ const CompactFileUploader = ({ onUploadComplete }) => {
         try {
             const formData = new FormData();
             formData.append('file', file);
-            
+
             const response = await fetch('/api/upload', {
                 method: 'POST',
                 body: formData
             });
-            
+
             if (!response.ok) throw new Error('Upload failed');
-            
+
             const result = await response.json();
-            
+
             clearInterval(progressInterval);
             setUploadProgress(prev => ({ ...prev, [file.name]: 100 }));
-            
+
             await new Promise(resolve => setTimeout(resolve, 500));
-            
+
             onUploadComplete(result);
-            
+
             if (!uploadQueue.length && isLastFile) {
                 setUploading(false);
                 setUploadProgress({});
             }
-            
+
         } catch (error) {
             console.error('Upload error:', error);
             alert(`Failed to upload ${file.name}`);
             clearInterval(progressInterval);
-            
+
             if (!uploadQueue.length && isLastFile) {
                 setUploading(false);
                 setUploadProgress({});
@@ -1790,12 +1954,12 @@ const CompactFileUploader = ({ onUploadComplete }) => {
 
     const handleFileSelect = async (e) => {
         const files = Array.from(e.target.files || []);
-        const validFiles = files.filter(file => 
+        const validFiles = files.filter(file =>
             file.name.match(/\.(tar|tar\.gz|tgz|zip)$/)
         );
-        
+
         if (validFiles.length === 0) return;
-        
+
         if (validFiles.length === 1) {
             await handleUpload(validFiles[0]);
         } else {
@@ -1805,9 +1969,9 @@ const CompactFileUploader = ({ onUploadComplete }) => {
 
     const overallProgress = uploadQueue.length > 0
         ? Math.round(
-            Object.values(uploadProgress).reduce((sum, p) => sum + p, 0) / 
+            Object.values(uploadProgress).reduce((sum, p) => sum + p, 0) /
             Object.keys(uploadProgress).length
-          )
+        )
         : uploadProgress[Object.keys(uploadProgress)[0]] || 0;
 
     return (
@@ -1836,7 +2000,7 @@ const CompactFileUploader = ({ onUploadComplete }) => {
                 id="compact-file-input"
                 disabled={uploading}
             />
-            
+
             {uploading && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center z-10" style={{ background: 'var(--bg-primary)' }}>
                     {uploadQueue.length > 0 ? (
@@ -1849,7 +2013,7 @@ const CompactFileUploader = ({ onUploadComplete }) => {
                                     Current: {currentUpload}
                                 </p>
                             </div>
-                            
+
                             <div className="w-64 space-y-2 mb-4 max-h-32 overflow-y-auto">
                                 {Object.entries(uploadProgress).map(([filename, progress]) => (
                                     <div key={filename} className="text-left">
@@ -1858,9 +2022,9 @@ const CompactFileUploader = ({ onUploadComplete }) => {
                                             <span>{progress}%</span>
                                         </div>
                                         <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-tertiary)' }}>
-                                            <div 
+                                            <div
                                                 className="h-full transition-all duration-300"
-                                                style={{ 
+                                                style={{
                                                     width: `${progress}%`,
                                                     background: progress === 100 ? '#10b981' : 'var(--accent)'
                                                 }}
@@ -1874,9 +2038,9 @@ const CompactFileUploader = ({ onUploadComplete }) => {
                         <>
                             <div className="w-48 mb-4">
                                 <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-tertiary)' }}>
-                                    <div 
+                                    <div
                                         className="h-full transition-all duration-300"
-                                        style={{ 
+                                        style={{
                                             width: `${overallProgress}%`,
                                             background: 'var(--accent)'
                                         }}
@@ -1890,24 +2054,24 @@ const CompactFileUploader = ({ onUploadComplete }) => {
                     )}
                 </div>
             )}
-            
+
             {!uploading && (
                 <label htmlFor="compact-file-input" className="text-center p-6 cursor-pointer">
-                    <Upload className="w-12 h-12 mx-auto mb-4" style={{ 
-                        color: isDragging ? 'var(--accent)' : 'var(--text-tertiary)' 
+                    <Upload className="w-12 h-12 mx-auto mb-4" style={{
+                        color: isDragging ? 'var(--accent)' : 'var(--text-tertiary)'
                     }} />
-                    
+
                     <h3 className="text-xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
-                        {isDragging 
-                            ? 'Drop your SOS archives here' 
+                        {isDragging
+                            ? 'Drop your SOS archives here'
                             : 'Drop files or click to browse'
                         }
                     </h3>
-                    
+
                     <p className="text-sm mb-3" style={{ color: 'var(--text-secondary)' }}>
                         💡 Multiple files supported
                     </p>
-                    
+
                     <div className="flex flex-wrap justify-center gap-2 text-xs">
                         {['tar', 'tar.gz', 'zip'].map(ext => (
                             <span key={ext} className="px-2 py-1 rounded-full" style={{
@@ -1935,12 +2099,12 @@ const FileUploader = ({ onUploadComplete }) => {
     const handleDrop = async (e) => {
         e.preventDefault();
         setIsDragging(false);
-        
+
         const files = Array.from(e.dataTransfer.files);
-        const validFiles = files.filter(file => 
+        const validFiles = files.filter(file =>
             file.name.match(/\.(tar|tar\.gz|tgz|zip)$/)
         );
-        
+
         if (validFiles.length === 0) {
             alert('Please upload valid SOS archives (.tar, .tar.gz, .zip)');
             return;
@@ -1959,18 +2123,18 @@ const FileUploader = ({ onUploadComplete }) => {
     const handleMultipleUploads = async (files) => {
         setUploading(true);
         setUploadQueue(files.map(f => f.name));
-        
+
         console.log(`Starting upload of ${files.length} files`);
-        
+
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             setCurrentUpload(file.name);
             console.log(`Uploading file ${i + 1}/${files.length}: ${file.name}`);
-            
+
             try {
                 await handleUpload(file, i === files.length - 1);
                 console.log(`Successfully uploaded: ${file.name}`);
-                
+
                 // Small delay between uploads to ensure proper state updates
                 if (i < files.length - 1) {
                     await new Promise(resolve => setTimeout(resolve, 100));
@@ -1980,7 +2144,7 @@ const FileUploader = ({ onUploadComplete }) => {
                 // Continue with next file
             }
         }
-        
+
         setUploadQueue([]);
         setCurrentUpload(null);
         setUploading(false);
@@ -1996,7 +2160,7 @@ const FileUploader = ({ onUploadComplete }) => {
         if (!uploadQueue.length) {
             setUploading(true);
         }
-        
+
         setUploadProgress(prev => ({ ...prev, [file.name]: 0 }));
 
         const progressInterval = setInterval(() => {
@@ -2009,34 +2173,34 @@ const FileUploader = ({ onUploadComplete }) => {
         try {
             const formData = new FormData();
             formData.append('file', file);
-            
+
             const response = await fetch('/api/upload', {
                 method: 'POST',
                 body: formData
             });
-            
+
             if (!response.ok) throw new Error('Upload failed');
-            
+
             const result = await response.json();
-            
+
             clearInterval(progressInterval);
             setUploadProgress(prev => ({ ...prev, [file.name]: 100 }));
-            
+
             // Small delay to show completion
             await new Promise(resolve => setTimeout(resolve, 500));
-            
+
             onUploadComplete(result);
-            
+
             if (!uploadQueue.length && isLastFile) {
                 setUploading(false);
                 setUploadProgress({});
             }
-            
+
         } catch (error) {
             console.error('Upload error:', error);
             alert(`Failed to upload ${file.name}`);
             clearInterval(progressInterval);
-            
+
             if (!uploadQueue.length && isLastFile) {
                 setUploading(false);
                 setUploadProgress({});
@@ -2046,12 +2210,12 @@ const FileUploader = ({ onUploadComplete }) => {
 
     const handleFileSelect = async (e) => {
         const files = Array.from(e.target.files || []);
-        const validFiles = files.filter(file => 
+        const validFiles = files.filter(file =>
             file.name.match(/\.(tar|tar\.gz|tgz|zip)$/)
         );
-        
+
         if (validFiles.length === 0) return;
-        
+
         if (validFiles.length === 1) {
             await handleUpload(validFiles[0]);
         } else {
@@ -2062,9 +2226,9 @@ const FileUploader = ({ onUploadComplete }) => {
     // Calculate overall progress for multiple files
     const overallProgress = uploadQueue.length > 0
         ? Math.round(
-            Object.values(uploadProgress).reduce((sum, p) => sum + p, 0) / 
+            Object.values(uploadProgress).reduce((sum, p) => sum + p, 0) /
             Object.keys(uploadProgress).length
-          )
+        )
         : uploadProgress[Object.keys(uploadProgress)[0]] || 0;
 
     return (
@@ -2094,7 +2258,7 @@ const FileUploader = ({ onUploadComplete }) => {
                     id="file-input"
                     disabled={uploading}
                 />
-                
+
                 {uploading && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center z-10" style={{ background: 'var(--bg-primary)' }}>
                         {uploadQueue.length > 0 ? (
@@ -2108,7 +2272,7 @@ const FileUploader = ({ onUploadComplete }) => {
                                         Current: {currentUpload}
                                     </p>
                                 </div>
-                                
+
                                 <div className="w-80 space-y-2 mb-4 max-h-48 overflow-y-auto">
                                     {Object.entries(uploadProgress).map(([filename, progress]) => (
                                         <div key={filename} className="text-left">
@@ -2117,9 +2281,9 @@ const FileUploader = ({ onUploadComplete }) => {
                                                 <span>{progress}%</span>
                                             </div>
                                             <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-tertiary)' }}>
-                                                <div 
+                                                <div
                                                     className="h-full transition-all duration-300"
-                                                    style={{ 
+                                                    style={{
                                                         width: `${progress}%`,
                                                         background: progress === 100 ? '#10b981' : 'var(--accent)'
                                                     }}
@@ -2128,7 +2292,7 @@ const FileUploader = ({ onUploadComplete }) => {
                                         </div>
                                     ))}
                                 </div>
-                                
+
                                 <p className="text-sm" style={{ color: 'var(--text-tertiary)' }}>
                                     Each file will open in a new tab
                                 </p>
@@ -2138,9 +2302,9 @@ const FileUploader = ({ onUploadComplete }) => {
                             <>
                                 <div className="w-64 mb-4">
                                     <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-tertiary)' }}>
-                                        <div 
+                                        <div
                                             className="h-full transition-all duration-300"
-                                            style={{ 
+                                            style={{
                                                 width: `${overallProgress}%`,
                                                 background: 'var(--accent)'
                                             }}
@@ -2157,28 +2321,28 @@ const FileUploader = ({ onUploadComplete }) => {
                         )}
                     </div>
                 )}
-                
+
                 {!uploading && (
                     <label htmlFor="file-input" className="text-center p-8 cursor-pointer">
-                        <Upload className="w-20 h-20 mx-auto mb-4" style={{ 
-                            color: isDragging ? 'var(--accent)' : 'var(--text-tertiary)' 
+                        <Upload className="w-20 h-20 mx-auto mb-4" style={{
+                            color: isDragging ? 'var(--accent)' : 'var(--text-tertiary)'
                         }} />
-                        
+
                         <h3 className="text-2xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
-                            {isDragging 
-                                ? 'Drop your SOS archives here' 
+                            {isDragging
+                                ? 'Drop your SOS archives here'
                                 : 'Upload GitLab SOS Archives'
                             }
                         </h3>
-                        
+
                         <p className="mb-2" style={{ color: 'var(--text-secondary)' }}>
                             Drag and drop or click to browse
                         </p>
-                        
+
                         <p className="text-sm mb-4" style={{ color: 'var(--text-tertiary)' }}>
                             💡 Tip: You can select or drop multiple files at once!
                         </p>
-                        
+
                         <div className="flex flex-wrap justify-center gap-2 text-sm">
                             {['tar', 'tar.gz', 'zip'].map(ext => (
                                 <span key={ext} className="px-3 py-1 rounded-full" style={{
@@ -2199,27 +2363,29 @@ const FileUploader = ({ onUploadComplete }) => {
 // Theme Toggle Component
 const ThemeToggle = () => {
     const { theme, toggleTheme } = useTheme();
-    
+
     return (
         <button
             onClick={toggleTheme}
-            className="w-full flex items-center justify-between px-4 py-3 rounded-xl smooth-transition"
+            className="flex items-center justify-between px-3 py-2 smooth-transition"
             style={{
                 background: 'var(--bg-primary)',
                 border: '1px solid var(--border-primary)',
-                color: 'var(--text-primary)'
+                color: 'var(--text-primary)',
+                borderRadius: '12px',
+                width: '100%'
             }}
         >
-            <span className="text-sm font-medium">Theme</span>
-            <div className="flex items-center gap-2">
+            <span className="text-xs font-medium">Theme</span>
+            <div className="flex items-center gap-1.5">
                 {theme === 'light' ? (
                     <>
-                        <Sun className="w-4 h-4" />
+                        <Sun className="w-3.5 h-3.5" />
                         <span className="text-xs">Light</span>
                     </>
                 ) : (
                     <>
-                        <Moon className="w-4 h-4" />
+                        <Moon className="w-3.5 h-3.5" />
                         <span className="text-xs">Dark</span>
                     </>
                 )}
@@ -2231,7 +2397,7 @@ const ThemeToggle = () => {
 // Active Nodes Display Component
 const ActiveNodesDisplay = ({ nodes, activeNodeId, onNodeSelect, onNodeClose }) => {
     if (nodes.length === 0) return null;
-    
+
     return (
         <div className="w-full max-w-6xl mx-auto">
             <div className="mb-6">
@@ -2243,14 +2409,14 @@ const ActiveNodesDisplay = ({ nodes, activeNodeId, onNodeSelect, onNodeClose }) 
                     Select a node to view its analysis or upload a new SOS archive
                 </p>
             </div>
-            
+
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {nodes.map(node => {
                     const isActive = node.id === activeNodeId;
                     const isProcessing = node.status === 'processing';
                     const isCompleted = node.status === 'completed';
                     const isFailed = node.status === 'failed';
-                    
+
                     return (
                         <div
                             key={node.id}
@@ -2265,13 +2431,13 @@ const ActiveNodesDisplay = ({ nodes, activeNodeId, onNodeSelect, onNodeClose }) 
                             {/* Status Badge */}
                             <div className="absolute top-2 right-2">
                                 {isProcessing && (
-                                    <div className="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full" 
-                                         style={{ color: 'var(--text-tertiary)' }} />
+                                    <div className="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full"
+                                        style={{ color: 'var(--text-tertiary)' }} />
                                 )}
                                 {isCompleted && <CheckCircle className="w-4 h-4 text-green-500" />}
                                 {isFailed && <AlertCircle className="w-4 h-4 text-red-500" />}
                             </div>
-                            
+
                             <div className="flex items-start gap-3">
                                 <div className="p-2 rounded-lg" style={{ background: 'var(--bg-primary)' }}>
                                     <Package className="w-5 h-5" style={{ color: 'var(--text-secondary)' }} />
@@ -2284,12 +2450,11 @@ const ActiveNodesDisplay = ({ nodes, activeNodeId, onNodeSelect, onNodeClose }) 
                                         {node.filename || node.sessionId}
                                     </p>
                                     <div className="flex items-center gap-2 mt-2">
-                                        <span className={`text-xs px-2 py-0.5 rounded-full ${
-                                            isProcessing ? 'bg-blue-500/20 text-blue-600' :
+                                        <span className={`text-xs px-2 py-0.5 rounded-full ${isProcessing ? 'bg-blue-500/20 text-blue-600' :
                                             isCompleted ? 'bg-green-500/20 text-green-600' :
-                                            isFailed ? 'bg-red-500/20 text-red-600' :
-                                            'bg-gray-500/20 text-gray-600'
-                                        }`}>
+                                                isFailed ? 'bg-red-500/20 text-red-600' :
+                                                    'bg-gray-500/20 text-gray-600'
+                                            }`}>
                                             {node.status}
                                         </span>
                                         {node.analysisData && (
@@ -2300,7 +2465,7 @@ const ActiveNodesDisplay = ({ nodes, activeNodeId, onNodeSelect, onNodeClose }) 
                                     </div>
                                 </div>
                             </div>
-                            
+
                             <button
                                 onClick={(e) => {
                                     e.stopPropagation();
@@ -2319,10 +2484,11 @@ const ActiveNodesDisplay = ({ nodes, activeNodeId, onNodeSelect, onNodeClose }) 
     );
 };
 
-// Tab with Rename Component
+// Chrome-Inspired Tab Component with Smart Truncation
 const TabWithRename = ({ node, isActive, onSelect, onRename, onClose }) => {
     const [isEditing, setIsEditing] = useState(false);
     const [editName, setEditName] = useState(node.name);
+    const [isHovered, setIsHovered] = useState(false);
     const inputRef = useRef(null);
 
     useEffect(() => {
@@ -2359,34 +2525,65 @@ const TabWithRename = ({ node, isActive, onSelect, onRename, onClose }) => {
         handleSave();
     };
 
-    // Extract cleaner filename from session ID or use stored filename
-    const shortFilename = node.filename 
-        ? (node.filename.length > 20 
-            ? node.filename.substring(0, 17) + '...' 
-            : node.filename)
-        : '';
+    // Smart truncation for filename
+    const truncateFilename = (filename, maxLength = 18) => {
+        if (!filename || filename.length <= maxLength) return filename;
+        const ext = filename.split('.').pop();
+        const nameWithoutExt = filename.substring(0, filename.lastIndexOf('.'));
+        const truncated = nameWithoutExt.substring(0, maxLength - ext.length - 4) + '...' + ext;
+        return truncated;
+    };
+
+    const shortFilename = node.filename ? truncateFilename(node.filename) : '';
+
+    // Determine if dark mode
+    const isDarkMode = typeof document !== 'undefined' &&
+        document.documentElement.getAttribute('data-theme') === 'dark';
+
+    // Chrome-style tab shape using clip-path
+    const tabShape = isActive
+        ? 'polygon(8px 0%, calc(100% - 8px) 0%, 100% 8px, 100% 100%, 0% 100%, 0% 8px)'
+        : 'none';
 
     return (
         <div
-            className={`flex items-center px-3 py-1 cursor-pointer smooth-transition ${
-                isActive ? 'border-b-3' : ''
-            }`}
+            className="relative flex items-center cursor-pointer group"
             style={{
-                background: isActive ? 'var(--bg-primary)' : 'var(--bg-secondary)',
-                border: isActive ? '2px solid var(--accent)' : '1px solid transparent',
-                borderRadius: '8px',
-                boxShadow: isActive ? '0 -2px 8px rgba(0,0,0,0.1)' : 'none',
-                marginTop: isActive ? '0' : '4px',
-                minWidth: '160px',
-                maxWidth: '280px',
-                height: '40px'
+                background: isActive
+                    ? 'var(--tab-bg-active)'
+                    : isHovered
+                        ? 'var(--tab-bg-hover)'
+                        : 'var(--tab-bg)',
+                minWidth: '140px',
+                maxWidth: '260px',
+                height: '28px',
+                paddingLeft: '12px',
+                paddingRight: '8px',
+                marginRight: '6px',
+                borderRadius: '14px',
+                border: isActive
+                    ? isDarkMode
+                        ? '1px solid rgba(255, 255, 255, 0.2)'
+                        : '1px solid var(--tab-border)'
+                    : '1px solid transparent',
+                boxShadow: isActive
+                    ? isDarkMode
+                        ? '0 0 24px rgba(200, 220, 255, 0.25), 0 0 12px rgba(150, 200, 255, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.15)'
+                        : '0 4px 16px rgba(0, 0, 0, 0.2)'
+                    : 'none',
+                backdropFilter: isActive ? 'blur(10px)' : 'none',
+                zIndex: isActive ? 10 : isHovered ? 5 : 1,
+                transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
+                transform: isActive ? 'scale(1.02)' : 'scale(1)',
+                overflow: 'hidden'
             }}
             onClick={onSelect}
-            title={`${node.name}${node.filename ? `: ${node.filename}` : ''}\nDouble-click to rename`}
+            onMouseEnter={() => setIsHovered(true)}
+            onMouseLeave={() => setIsHovered(false)}
+            title={`${node.name}${node.filename ? `\n${node.filename}` : ''}\n\nDouble-click to rename`}
         >
-            <Server className="w-3 h-3 mr-2 flex-shrink-0" />
-            
-            <div className="flex-1 min-w-0 mr-2">
+            {/* Content */}
+            <div className="flex-1 min-w-0 mr-2 overflow-hidden">
                 {isEditing ? (
                     <input
                         ref={inputRef}
@@ -2395,49 +2592,99 @@ const TabWithRename = ({ node, isActive, onSelect, onRename, onClose }) => {
                         onChange={(e) => setEditName(e.target.value)}
                         onKeyDown={handleKeyDown}
                         onBlur={handleBlur}
-                        className="w-full px-1 py-0.5 text-xs font-medium rounded border-0 outline-none"
+                        className="w-full px-2 py-1 text-xs font-medium rounded"
                         style={{
                             background: 'var(--bg-secondary)',
                             color: 'var(--text-primary)',
-                            border: '1px solid var(--accent)'
+                            border: '1px solid var(--accent)',
+                            outline: 'none'
                         }}
                         maxLength={30}
                         onClick={(e) => e.stopPropagation()}
                     />
                 ) : (
-                    <div onDoubleClick={handleDoubleClick} className="truncate flex flex-col justify-center">
-                        <span className="font-medium text-xs leading-tight" style={{ color: 'var(--text-primary)' }}>
+                    <div
+                        onDoubleClick={handleDoubleClick}
+                        className="flex items-center justify-center w-full"
+                    >
+                        <div
+                            className="truncate text-center"
+                            style={{
+                                color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                                fontSize: '11.5px',
+                                fontWeight: isActive ? 600 : 500,
+                                transition: 'color 0.2s ease'
+                            }}
+                            title={node.name}
+                        >
                             {node.name}
-                        </span>
-                        {shortFilename && (
-                            <div className="text-xs truncate leading-tight" style={{ color: 'var(--text-tertiary)', fontSize: '10px', lineHeight: '11px', marginTop: '1px' }}>
-                                {shortFilename}
-                            </div>
-                        )}
+                        </div>
                     </div>
                 )}
             </div>
 
+            {/* Status */}
             {node.status === 'processing' && (
-                <div className="animate-spin w-2.5 h-2.5 border border-current border-t-transparent rounded-full mr-1 flex-shrink-0" />
+                <div
+                    className="animate-spin border-2 border-current border-t-transparent rounded-full flex-shrink-0 mr-1"
+                    style={{
+                        width: '10px',
+                        height: '10px',
+                        borderColor: 'var(--accent)',
+                        borderTopColor: 'transparent'
+                    }}
+                />
             )}
             {node.status === 'completed' && (
-                <CheckCircle className="w-3 h-3 text-green-500 mr-1 flex-shrink-0" />
+                <CheckCircle
+                    className="flex-shrink-0 mr-1"
+                    style={{
+                        width: '10px',
+                        height: '10px',
+                        color: '#10b981'
+                    }}
+                />
             )}
             {node.status === 'failed' && (
-                <AlertCircle className="w-3 h-3 text-red-500 mr-1 flex-shrink-0" />
+                <AlertCircle
+                    className="flex-shrink-0 mr-1"
+                    style={{
+                        width: '10px',
+                        height: '10px',
+                        color: '#ef4444'
+                    }}
+                />
             )}
-            
+
+            {/* Close button */}
             <button
                 onClick={(e) => {
                     e.stopPropagation();
                     onClose();
                 }}
-                className="p-0.5 rounded smooth-transition flex-shrink-0 opacity-60 hover:opacity-100"
-                style={{ ':hover': { background: 'var(--hover-bg)' } }}
+                className="flex-shrink-0 rounded-full"
+                style={{
+                    width: '16px',
+                    height: '16px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    opacity: isHovered || isActive ? 1 : 0,
+                    background: 'transparent',
+                    color: 'var(--text-tertiary)',
+                    transition: 'all 0.2s ease'
+                }}
+                onMouseEnter={(e) => {
+                    e.currentTarget.style.background = 'rgba(0,0,0,0.1)';
+                    e.currentTarget.style.color = 'var(--text-primary)';
+                }}
+                onMouseLeave={(e) => {
+                    e.currentTarget.style.background = 'transparent';
+                    e.currentTarget.style.color = 'var(--text-tertiary)';
+                }}
                 title="Close tab"
             >
-                <X className="w-2.5 h-2.5" />
+                <X style={{ width: '9px', height: '9px', strokeWidth: '2.5' }} />
             </button>
         </div>
     );
@@ -2450,18 +2697,25 @@ function App() {
     const [activeNodeId, setActiveNodeId] = useState(null);
     const nodeIdCounter = useRef(1);
 
+    // Sidebar width state
+    const [sidebarWidth, setSidebarWidth] = useState(224); // 56 * 4 = 224px (w-56)
+    const [isResizing, setIsResizing] = useState(false);
+    const sidebarRef = useRef(null);
+
     // Get current node data
     const currentNode = nodes.find(n => n.id === activeNodeId);
     const sessionId = currentNode?.sessionId;
     const analysisData = currentNode?.analysisData;
-    
+
     // Existing state (per node)
     const [activeTab, setActiveTab] = useState('upload');
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState(null);
     const [navigationTarget, setNavigationTarget] = useState({ file: null, line: null });
     const [powerSearchQuery, setPowerSearchQuery] = useState('');
-    
+    const [showTerminal, setShowTerminal] = useState(false);
+    const [showSlate, setShowSlate] = useState(false);
+
     // Navigation handler
     const handleNavigateToLog = useCallback((file, lineNumber) => {
         setNavigationTarget({ file, line: lineNumber });
@@ -2514,9 +2768,9 @@ function App() {
                     const response = await fetch(`/api/analysis/${node.sessionId}`);
                     const data = await response.json();
 
-                    if (data.status === 'completed' || data.status === 'failed') {
-                        setNodes(prev => prev.map(n => 
-                            n.id === node.id 
+                    if (data.status === 'completed' || data.status === 'failed' || data.status === 'ready') {
+                        setNodes(prev => prev.map(n =>
+                            n.id === node.id
                                 ? { ...n, status: data.status, analysisData: data }
                                 : n
                         ));
@@ -2539,39 +2793,46 @@ function App() {
         const timestamp = Date.now();
         const nodeNum = nodeIdCounter.current++;
         const nodeId = `node_${nodeNum}_${timestamp}`;
-        const nodeName = `Node ${nodeNum}`;
-        
-        // Extract filename from session_id
-        const filename = result.session_id.split('_').slice(2).join('_');
-        
+
+        // Check if this is a custom session (already completed)
+        const isCustom = result.type === 'custom' || result.session_id?.startsWith('custom_');
+        const isAlreadyCompleted = result.status === 'completed';
+
+        const nodeName = isCustom ? `Custom ${nodeNum}` : `Node ${nodeNum}`;
+        const filename = isCustom
+            ? 'Custom Session'
+            : (result.session_id?.split('_').slice(2).join('_') || 'Unknown');
+
         console.log(`Creating node: ${nodeName} (${nodeId}) for file: ${filename}`);
-        
+
         // Create new node
         const newNode = {
             id: nodeId,
             name: nodeName,
             sessionId: result.session_id,
-            status: 'processing',
-            analysisData: null,
+            // KEY FIX: If already completed (custom session), use completed status
+            status: isAlreadyCompleted ? 'completed' : (result.status || 'processing'),
+            // KEY FIX: If already completed, use the result as analysisData
+            analysisData: isAlreadyCompleted ? result : (result.status === 'ready' ? result : null),
             filename: filename,
-            nodeNumber: nodeNum
+            nodeNumber: nodeNum,
+            isCustom: isCustom
         };
-        
+
         // Add node to state
         setNodes(prev => {
             const updatedNodes = [...prev, newNode];
-            
-            // Only switch tabs for the first upload
-            if (prev.length === 0) {
-                setTimeout(() => {
-                    setActiveNodeId(nodeId);
-                    setActiveTab('viewer');
-                }, 0);
-            }
-            
+
+            setTimeout(() => {
+                setActiveNodeId(nodeId);
+                // For custom sessions, stay on upload page so user can add files
+                // For standard sessions, go to viewer
+                setActiveTab(isCustom ? 'upload' : 'viewer');
+            }, 0);
+
             return updatedNodes;
         });
-        
+
         setError(null);
     }, []);
 
@@ -2582,9 +2843,9 @@ function App() {
     const closeNode = (nodeId) => {
         if (confirm('Close this node? Analysis data will be lost.')) {
             const nodeToClose = nodes.find(n => n.id === nodeId);
-            
+
             setNodes(prev => prev.filter(n => n.id !== nodeId));
-            
+
             if (nodeId === activeNodeId) {
                 const remainingNodes = nodes.filter(n => n.id !== nodeId);
                 if (remainingNodes.length > 0) {
@@ -2594,12 +2855,12 @@ function App() {
                     setActiveTab('upload');
                 }
             }
-            
+
             if (nodeToClose) {
                 localStorage.removeItem(`currentAnalysis_${nodeToClose.sessionId}`);
                 localStorage.removeItem(`logCache_${nodeToClose.sessionId}`);
                 // Clear auto-analysis for this session
-                fetch(`/api/auto-analysis/${nodeToClose.sessionId}`, { method: 'DELETE' }).catch(() => {});
+                fetch(`/api/auto-analysis/${nodeToClose.sessionId}`, { method: 'DELETE' }).catch(() => { });
             }
         }
     };
@@ -2610,15 +2871,15 @@ function App() {
                 localStorage.removeItem(`currentAnalysis_${node.sessionId}`);
                 localStorage.removeItem(`logCache_${node.sessionId}`);
                 // Clear auto-analysis for each session
-                fetch(`/api/auto-analysis/${node.sessionId}`, { method: 'DELETE' }).catch(() => {});
+                fetch(`/api/auto-analysis/${node.sessionId}`, { method: 'DELETE' }).catch(() => { });
             });
-            
+
             setNodes([]);
             setActiveNodeId(null);
             setActiveTab('upload');
             setError(null);
             setNavigationTarget({ file: null, line: null });
-            
+
             localStorage.removeItem('sos_nodes');
             nodeIdCounter.current = 1;
         }
@@ -2630,19 +2891,19 @@ function App() {
                 const response = await fetch('/api/sessions/clear', {
                     method: 'DELETE'
                 });
-                
+
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
-                
+
                 const result = await response.json();
-                
+
                 // Clear all local node data (same as clearAllNodes)
                 nodes.forEach(node => {
                     localStorage.removeItem(`currentAnalysis_${node.sessionId}`);
                     localStorage.removeItem(`logCache_${node.sessionId}`);
                 });
-                
+
                 // Reset all state
                 setNodes([]);
                 setActiveNodeId(null);
@@ -2651,10 +2912,10 @@ function App() {
                 setNavigationTarget({ file: null, line: null });
                 localStorage.removeItem('sos_nodes');
                 nodeIdCounter.current = 1;
-                
+
                 // Show success message
                 alert(`✅ ${result.message}\n💾 Space freed: ${result.space_freed}\n🗂️ All local nodes cleared`);
-                
+
             } catch (error) {
                 console.error('Failed to clear sessions:', error);
                 alert(`❌ Failed to clear sessions: ${error.message}`);
@@ -2670,53 +2931,141 @@ function App() {
         return null;
     };
 
+    // Sidebar resize handlers
+    const handleMouseDown = (e) => {
+        setIsResizing(true);
+        e.preventDefault();
+    };
+
+    useEffect(() => {
+        const handleMouseMove = (e) => {
+            if (!isResizing) return;
+            const newWidth = e.clientX;
+            if (newWidth >= 180 && newWidth <= 400) {
+                setSidebarWidth(newWidth);
+            }
+        };
+
+        const handleMouseUp = () => {
+            setIsResizing(false);
+        };
+
+        if (isResizing) {
+            document.addEventListener('mousemove', handleMouseMove);
+            document.addEventListener('mouseup', handleMouseUp);
+        }
+
+        return () => {
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, [isResizing]);
+
     return (
         <ThemeProvider>
             <div className="h-screen flex flex-col" style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
-                {/* Node Tabs */}
+                {/* Chrome-Style Node Tabs */}
                 {nodes.length > 0 && (
-                    <div className="flex items-center" style={{ 
-                        background: 'var(--bg-secondary)', 
-                        borderBottom: '1px solid var(--border-primary)',
-                        height: '44px',
-                        paddingTop: '4px'
-                    }}>
-                        <div className="flex-1 flex overflow-x-auto scrollbar-thin" style={{
-                            scrollbarWidth: 'thin',
-                            scrollbarColor: 'var(--text-tertiary) var(--bg-secondary)'
-                        }}>
-                            {nodes.map(node => {
-                                return (
-                                    <TabWithRename
-                                        key={node.id}
-                                        node={node}
-                                        isActive={node.id === activeNodeId}
-                                        onSelect={() => setActiveNodeId(node.id)}
-                                        onRename={(newName) => {
-                                            setNodes(prev => prev.map(n => 
-                                                n.id === node.id ? { ...n, name: newName } : n
-                                            ));
-                                        }}
-                                        onClose={() => closeNode(node.id)}
-                                    />
-                                );
-                            })}
+                    <div
+                        className="flex items-center relative"
+                        style={{
+                            background: 'var(--bg-secondary)',
+                            borderBottom: '1px solid var(--border-primary)',
+                            height: '37px',
+                            overflow: 'hidden',
+                            paddingTop: '5px',
+                            paddingBottom: '2px'
+                        }}
+                    >
+                        {/* Tab Container with Smooth Scroll */}
+                        <div
+                            className="flex-1 flex overflow-x-auto overflow-y-hidden"
+                            style={{
+                                scrollbarWidth: 'none', // Firefox
+                                msOverflowStyle: 'none', // IE/Edge
+                                scrollBehavior: 'smooth',
+                                paddingLeft: '4px',
+                                paddingRight: '4px'
+                            }}
+                            onWheel={(e) => {
+                                // Horizontal scroll with mouse wheel
+                                if (e.deltaY !== 0) {
+                                    e.currentTarget.scrollLeft += e.deltaY;
+                                    e.preventDefault();
+                                }
+                            }}
+                        >
+                            {/* Hide scrollbar for Chrome/Safari */}
+                            <style>{`
+                                .flex-1::-webkit-scrollbar {
+                                    display: none;
+                                }
+                            `}</style>
+
+                            {nodes.map(node => (
+                                <TabWithRename
+                                    key={node.id}
+                                    node={node}
+                                    isActive={node.id === activeNodeId}
+                                    onSelect={() => setActiveNodeId(node.id)}
+                                    onRename={(newName) => {
+                                        setNodes(prev => prev.map(n =>
+                                            n.id === node.id ? { ...n, name: newName } : n
+                                        ));
+                                    }}
+                                    onClose={() => closeNode(node.id)}
+                                />
+                            ))}
+
+                            {/* New Tab Button - Chrome Style */}
                             <button
                                 onClick={addNewNode}
-                                className="flex items-center px-3 py-1 smooth-transition"
+                                className="flex items-center justify-center smooth-transition flex-shrink-0"
                                 style={{
+                                    width: '32px',
+                                    height: '32px',
+                                    marginLeft: '4px',
+                                    marginRight: '4px',
+                                    borderRadius: '6px',
                                     background: 'transparent',
-                                    borderRight: '1px solid var(--border-primary)',
-                                    height: '40px'
+                                    color: 'var(--text-tertiary)',
+                                    transition: 'all 0.15s ease'
                                 }}
-                                title="Add new node"
+                                onMouseEnter={(e) => {
+                                    e.currentTarget.style.background = 'var(--bg-tertiary)';
+                                    e.currentTarget.style.color = 'var(--text-primary)';
+                                }}
+                                onMouseLeave={(e) => {
+                                    e.currentTarget.style.background = 'transparent';
+                                    e.currentTarget.style.color = 'var(--text-tertiary)';
+                                }}
+                                title="New tab (Ctrl+T)"
                             >
-                                <Plus className="w-4 h-4" />
+                                <Plus style={{ width: '16px', height: '16px' }} />
                             </button>
                         </div>
+
+                        {/* Tab Counter Badge */}
                         {nodes.length > 1 && (
-                            <div className="px-3 text-xs" style={{ color: 'var(--text-tertiary)' }}>
-                                {nodes.length} nodes
+                            <div
+                                className="flex items-center px-3 flex-shrink-0"
+                                style={{
+                                    height: '100%',
+                                    borderLeft: '1px solid var(--border-primary)'
+                                }}
+                            >
+                                <div
+                                    className="px-2 py-0.5 rounded-full"
+                                    style={{
+                                        background: 'var(--bg-tertiary)',
+                                        color: 'var(--text-secondary)',
+                                        fontSize: '10px',
+                                        fontWeight: 600,
+                                        letterSpacing: '0.5px'
+                                    }}
+                                >
+                                    {nodes.length}
+                                </div>
                             </div>
                         )}
                     </div>
@@ -2724,10 +3073,17 @@ function App() {
 
                 <div className="flex-1 flex overflow-hidden">
                     {/* Sidebar */}
-                    <div className="w-56 shadow-xl flex flex-col" style={{ 
-                        background: 'var(--bg-secondary)', 
-                        borderRight: '1px solid var(--border-primary)' 
-                    }}>
+                    <div
+                        ref={sidebarRef}
+                        className="shadow-xl flex flex-col relative"
+                        style={{
+                            width: `${sidebarWidth}px`,
+                            minWidth: '180px',
+                            maxWidth: '400px',
+                            background: 'var(--bg-secondary)',
+                            borderRight: '1px solid var(--border-primary)'
+                        }}
+                    >
                         <div className="p-6">
                             <h1 className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>
                                 GitLab SOS
@@ -2735,33 +3091,51 @@ function App() {
                             <p className="text-sm mt-1" style={{ color: 'var(--text-secondary)' }}>Log Analysis Platform</p>
                         </div>
 
-                        <nav className="px-4 py-4 flex-1 overflow-y-auto">
+                        <nav className="px-3 py-4 flex-1 overflow-y-auto">
                             {[
                                 { id: 'upload', icon: Upload, label: 'Upload SOS', enabled: true },
                                 { id: 'viewer', icon: FileText, label: 'Log Viewer', enabled: !!analysisData },
                                 { id: 'auto-analysis', icon: Sparkles, label: 'Auto-Analysis', enabled: !!analysisData },
                                 { id: 'fast-stats', icon: BarChart3, label: 'FastStats', enabled: !!analysisData },
                                 { id: 'power-search', icon: Zap, label: 'Power Search', enabled: !!analysisData },
-                                { id: 'system', icon: Activity, label: 'System Metrics', enabled: !!analysisData }
+                                { id: 'loggrep', icon: Search, label: 'LogGrep', enabled: true },
+                                { id: 'tracer', icon: GitBranch, label: 'Request Tracer', enabled: true },
+                                { id: 'system', icon: Activity, label: 'System Metrics', enabled: !!analysisData },
+                                { id: 'terminal', icon: Terminal, label: 'Terminal', enabled: true },
+                                { id: 'slate', icon: Layers, label: 'Slate', enabled: true, isToggle: true }
                             ].map(item => (
                                 <button
                                     key={item.id}
-                                    onClick={() => setActiveTab(item.id)}
+                                    onClick={() => {
+                                        if (item.id === 'terminal') {
+                                            setShowTerminal(!showTerminal);
+                                        } else if (item.id === 'slate') {
+                                            setShowSlate(!showSlate);
+                                        } else {
+                                            setActiveTab(item.id);
+                                        }
+                                    }}
                                     disabled={!item.enabled}
-                                    className={`w-full flex items-center px-3 py-2 mb-1.5 rounded-lg text-sm smooth-transition ${
-                                        activeTab === item.id 
-                                            ? 'btn-primary' 
-                                            : 'btn-secondary'
-                                    } ${!item.enabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                    className={`flex items-center px-2.5 py-1.5 mb-1 text-xs smooth-transition ${item.id === 'terminal'
+                                        ? (showTerminal ? 'btn-primary' : 'btn-secondary')
+                                        : item.id === 'slate'
+                                            ? (showSlate ? 'btn-primary' : 'btn-secondary')
+                                            : (activeTab === item.id ? 'btn-primary' : 'btn-secondary')
+                                        } ${!item.enabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                    style={{
+                                        borderRadius: '12px',
+                                        width: '100%',
+                                        justifyContent: 'flex-start'
+                                    }}
                                 >
-                                    <item.icon className="w-4 h-4 mr-2.5" />
+                                    <item.icon className="w-3.5 h-3.5 mr-2" />
                                     {item.label}
                                 </button>
                             ))}
                         </nav>
 
                         {/* Theme Toggle */}
-                        <div className="p-4" style={{ borderTop: '1px solid var(--border-primary)' }}>
+                        <div className="p-3">
                             <ThemeToggle />
                         </div>
 
@@ -2827,15 +3201,60 @@ function App() {
                                 </div>
                             </div>
                         </div>
+
+                        {/* Resize handle */}
+                        <div
+                            onMouseDown={handleMouseDown}
+                            className="absolute top-0 right-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-500/50 transition-colors"
+                            style={{
+                                background: isResizing ? 'var(--accent)' : 'transparent'
+                            }}
+                            title="Drag to resize sidebar"
+                        />
                     </div>
 
                     {/* Main Content */}
                     <div className="flex-1 overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
                         {activeTab === 'upload' && (
-                            nodes.length === 0 ? (
+                            // If current node is a custom session, show add files interface
+                            currentNode?.isCustom ? (
+                                <CustomSessionAddFiles
+                                    sessionId={currentNode.sessionId}
+                                    onFilesAdded={async (updatedAnalysis) => {
+                                        console.log('📥 Received updated analysis from CustomSessionAddFiles');
+                                        console.log('   Total files:', updatedAnalysis.total_files);
+                                        console.log('   Log files:', Object.keys(updatedAnalysis.log_files || {}));
+
+                                        // Update the node in state with the analysis data
+                                        setNodes(prev => {
+                                            const updated = prev.map(n => {
+                                                if (n.id === currentNode.id) {
+                                                    console.log('✅ Updating node:', n.id, 'with', updatedAnalysis.total_files, 'files');
+                                                    return {
+                                                        ...n,
+                                                        analysisData: updatedAnalysis,
+                                                        status: 'completed'
+                                                    };
+                                                }
+                                                return n;
+                                            });
+                                            console.log('🔄 Nodes updated, triggering re-render');
+                                            return updated;
+                                        });
+
+                                        // Switch to viewer tab to see the files
+                                        if (updatedAnalysis.total_files > 0) {
+                                            console.log('🔀 Switching to viewer tab');
+                                            setTimeout(() => {
+                                                setActiveTab('viewer');
+                                            }, 300);
+                                        }
+                                    }}
+                                />
+                            ) : nodes.length === 0 ? (
                                 <FileUploader onUploadComplete={handleUploadComplete} />
                             ) : (
-                                <EnhancedUploadPage 
+                                <EnhancedUploadPage
                                     nodes={nodes}
                                     onUploadComplete={handleUploadComplete}
                                     onNodeSelect={setActiveNodeId}
@@ -2845,16 +3264,24 @@ function App() {
                         )}
 
                         {activeTab === 'viewer' && analysisData && (
-                            <EnhancedLogViewer 
-                                sessionId={sessionId} 
+                            <EnhancedLogViewer
+                                sessionId={sessionId}
                                 analysisData={analysisData}
                                 initialFile={navigationTarget.file}
                                 initialLine={navigationTarget.line}
+                                onAnalysisUpdated={(updatedAnalysis) => {
+                                    console.log('🔄 App.jsx updating node with new analysis');
+                                    setNodes(prev => prev.map(n =>
+                                        n.id === activeNodeId
+                                            ? { ...n, analysisData: updatedAnalysis }
+                                            : n
+                                    ));
+                                }}
                             />
                         )}
 
                         {activeTab === 'fast-stats' && analysisData && (
-                            <FastStatsDashboard 
+                            <FastStatsDashboard
                                 sessionId={sessionId}
                                 analysisData={analysisData}
                                 nodes={nodes}
@@ -2864,15 +3291,15 @@ function App() {
                         )}
 
                         {activeTab === 'auto-analysis' && analysisData && (
-                            <AutoAnalysis 
+                            <AutoAnalysis
                                 sessionId={sessionId}
                                 onNavigateToLog={handleNavigateToLog}
                             />
                         )}
 
                         {activeTab === 'power-search' && analysisData && (
-                            <PowerSearch 
-                                sessionId={sessionId} 
+                            <PowerSearch
+                                sessionId={sessionId}
                                 analysisData={analysisData}
                                 nodes={nodes}
                                 currentNodeId={activeNodeId}
@@ -2882,6 +3309,14 @@ function App() {
 
                         {activeTab === 'system' && analysisData && (
                             <SystemMetrics sessionId={sessionId} />
+                        )}
+
+                        {activeTab === 'loggrep' && (
+                            <LogGrep />
+                        )}
+
+                        {activeTab === 'tracer' && (
+                            <RequestChainTracer />
                         )}
                     </div>
                 </div>
@@ -2895,7 +3330,25 @@ function App() {
                         onExecuteSearch={handleExecuteSearch}
                     />
                 )}
+
+                {/* Terminal Panel */}
+                {showTerminal && (
+                    <TerminalPanel
+                        isOpen={showTerminal}
+                        onClose={() => setShowTerminal(false)}
+                        defaultHeight={300}
+                        minHeight={150}
+                        maxHeight={600}
+                    />
+                )}
             </div>
+
+            {/* Troubleshooting Slate */}
+            <TroubleshootingSlate
+                isOpen={showSlate}
+                onClose={() => setShowSlate(false)}
+                onToggle={() => setShowSlate(!showSlate)}
+            />
         </ThemeProvider>
     );
 }

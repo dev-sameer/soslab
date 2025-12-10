@@ -2128,6 +2128,76 @@ class PowerSearchEngineOptimized(PowerSearchEngine):
         
         # Quick JSON detection pattern
         self.json_start_pattern = re.compile(r'^\s*[\[{]')
+
+    def _optimize_query_filters(self, query: SearchQuery) -> SearchQuery:
+        """
+        Reorder filters for optimal execution (most selective first)
+        Surgical optimization - doesn't change results, only execution order
+        """
+        if not query.filters or len(query.filters) <= 1:
+            return query
+        
+        # Score each filter by estimated selectivity (lower = more selective = execute first)
+        def selectivity_score(f: SearchFilter) -> int:
+            # Service filters are very selective - execute first
+            if f.field == 'service':
+                return 0
+            
+            # Severity/level filters are quite selective
+            if f.field in ['severity', 'level']:
+                return 1
+            
+            # Status code filters
+            if f.field == 'status':
+                return 2
+            
+            # Equality/exact match more selective than contains
+            if f.operator in [Operator.EQ, Operator.NEQ]:
+                return 3
+            
+            # Numeric comparisons
+            if f.operator in [Operator.GT, Operator.GTE, Operator.LT, Operator.LTE]:
+                return 4
+            
+            # Text contains less selective
+            if f.operator in [Operator.CONTAINS, Operator.NOT_CONTAINS]:
+                return 5
+            
+            # Regex least selective
+            if f.operator in [Operator.REGEX, Operator.NOT_REGEX]:
+                return 6
+            
+            return 5
+        
+        # Sort filters by selectivity
+        optimized_filters = sorted(query.filters, key=selectivity_score)
+        
+        # Create new query with optimized order
+        optimized_query = SearchQuery(
+            filters=optimized_filters,
+            logical_op=query.logical_op,
+            sub_queries=query.sub_queries,
+            is_negated=query.is_negated
+        )
+        
+        return optimized_query
+    
+    def search(self, session_id: str, query: Union[str, SearchQuery],
+               files: Dict[str, Any], limit: int = 1000,
+               context_lines: int = 0) -> Generator[Dict, None, None]:
+        """
+        Optimized search with filter reordering
+        Override parent to add optimization step
+        """
+        # Parse query if string
+        if isinstance(query, str):
+            query = self.parse_query(query)
+        
+        # Optimize filter order for better performance
+        query = self._optimize_query_filters(query)
+        
+        # Use parent's search logic
+        yield from super().search(session_id, query, files, limit, context_lines)
         
     def _try_parse_json_optimized(self, line: str) -> Optional[Dict]:
         """Optimized JSON parsing with quick rejection"""
@@ -2474,6 +2544,369 @@ class PowerSearchEngineOptimized(PowerSearchEngine):
         pattern_lower = pattern.lower()
         return (pattern_lower in service.lower() or 
                 pattern_lower in filename)
+
+
+
+class QueryValidator:
+    """
+    Real-time query validation and field suggestion
+    Surgical addition - does not modify existing classes
+    """
+    
+    def __init__(self, search_engine: PowerSearchEngine = None):
+        self.search_engine = search_engine
+        
+        # Valid operators
+        self.operators = [':', '=', '!=', '>', '>=', '<', '<=', '~', '!~', '=~']
+        
+        # Reserved keywords
+        self.keywords = {'AND', 'OR', 'NOT'}
+        
+        # Common GitLab log fields
+        self.common_fields = {
+            'severity', 'level', 'time', 'timestamp', '@timestamp',
+            'message', 'msg', 'error', 'exception',
+            'status', 'method', 'path', 'controller', 'action',
+            'duration_s', 'duration_ms', 'db_duration_s', 'view_duration_s',
+            'user', 'username', 'user_id', 'meta.user',
+            'remote_ip', 'ip', 'user_agent',
+            'correlation_id', 'request_id',
+            'service', 'component',
+            'class', 'exception.class', 'exception.message',
+            'queue', 'queue_duration_s',
+            'params', 'route', 'endpoint_id',
+            'gitaly_calls', 'gitaly_duration_s',
+            'redis_calls', 'redis_duration_s',
+            'db_count', 'db_write_count',
+            'meta.feature_category', 'meta.caller_id'
+        }
+        
+        # Field value suggestions for common fields
+        self.field_values = {
+            'severity': ['INFO', 'WARN', 'ERROR', 'FATAL', 'DEBUG'],
+            'level': ['info', 'warn', 'warning', 'error', 'fatal', 'debug'],
+            'method': ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'],
+            'service': [
+                'rails', 'sidekiq', 'gitaly', 'workhorse', 'shell', 'puma',
+                'nginx', 'postgresql', 'redis', 'registry', 'pages', 'prometheus',
+                'grafana', 'alertmanager', 'praefect', 'kas', 'mailroom',
+                'patroni', 'pgbouncer', 'sentinel'
+            ]
+        }
+    
+    def validate_query(self, query_string: str) -> Dict[str, Any]:
+        """
+        Validate query syntax and return detailed feedback
+        Returns: {valid: bool, errors: [], warnings: [], suggestions: []}
+        """
+        result = {
+            'valid': True,
+            'errors': [],
+            'warnings': [],
+            'suggestions': [],
+            'parsed_filters': []
+        }
+        
+        if not query_string or not query_string.strip():
+            return result
+        
+        query = query_string.strip()
+        
+        # Check for unbalanced quotes
+        single_quotes = query.count("'") - query.count("\\'")
+        double_quotes = query.count('"') - query.count('\\"')
+        
+        if single_quotes % 2 != 0:
+            result['valid'] = False
+            result['errors'].append({
+                'type': 'syntax',
+                'message': 'Unbalanced single quotes',
+                'position': query.rfind("'")
+            })
+        
+        if double_quotes % 2 != 0:
+            result['valid'] = False
+            result['errors'].append({
+                'type': 'syntax',
+                'message': 'Unbalanced double quotes',
+                'position': query.rfind('"')
+            })
+        
+        # Check for unbalanced parentheses
+        paren_count = 0
+        for i, char in enumerate(query):
+            if char == '(':
+                paren_count += 1
+            elif char == ')':
+                paren_count -= 1
+            if paren_count < 0:
+                result['valid'] = False
+                result['errors'].append({
+                    'type': 'syntax',
+                    'message': 'Unexpected closing parenthesis',
+                    'position': i
+                })
+                break
+        
+        if paren_count > 0:
+            result['valid'] = False
+            result['errors'].append({
+                'type': 'syntax',
+                'message': f'Missing {paren_count} closing parenthesis(es)',
+                'position': len(query)
+            })
+        
+        # Parse and validate individual filters
+        # Simple tokenization for validation
+        tokens = self._tokenize_for_validation(query)
+        
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            
+            # Skip logical operators
+            if token.upper() in self.keywords:
+                # Check for dangling operators
+                if i == len(tokens) - 1:
+                    result['warnings'].append({
+                        'type': 'incomplete',
+                        'message': f'Query ends with "{token}" - expecting more conditions'
+                    })
+                i += 1
+                continue
+            
+            # Check if it's a field:value filter
+            filter_match = self._parse_filter_token(token)
+            if filter_match:
+                field, op, value = filter_match
+                result['parsed_filters'].append({'field': field, 'operator': op, 'value': value})
+                
+                # Validate field name
+                if field and field not in self.common_fields:
+                    # Check if it's a nested field pattern
+                    if '.' not in field and not any(cf.startswith(field) for cf in self.common_fields):
+                        result['warnings'].append({
+                            'type': 'unknown_field',
+                            'message': f'Unknown field "{field}" - may not match any logs',
+                            'field': field,
+                            'suggestions': self._suggest_fields(field)
+                        })
+                
+                # Validate operator usage
+                if op in ['>', '>=', '<', '<=']:
+                    # Check if value looks numeric
+                    try:
+                        float(value)
+                    except ValueError:
+                        result['warnings'].append({
+                            'type': 'type_mismatch',
+                            'message': f'Numeric operator "{op}" used with non-numeric value "{value}"'
+                        })
+                
+                # Suggest values for known fields
+                if field in self.field_values and value:
+                    known_values = self.field_values[field]
+                    if value.upper() not in [v.upper() for v in known_values]:
+                        similar = [v for v in known_values if value.lower() in v.lower()]
+                        if similar:
+                            result['suggestions'].append({
+                                'type': 'value_suggestion',
+                                'message': f'Did you mean: {", ".join(similar)}?',
+                                'field': field,
+                                'values': similar
+                            })
+            
+            i += 1
+        
+        # Check for common mistakes
+        if ' and ' in query.lower() and ' AND ' not in query:
+            result['warnings'].append({
+                'type': 'case_sensitivity',
+                'message': 'Use "AND" (uppercase) for logical AND operator'
+            })
+        
+        if ' or ' in query.lower() and ' OR ' not in query:
+            result['warnings'].append({
+                'type': 'case_sensitivity',
+                'message': 'Use "OR" (uppercase) for logical OR operator'
+            })
+        
+        if ' not ' in query.lower() and ' NOT ' not in query:
+            result['warnings'].append({
+                'type': 'case_sensitivity',
+                'message': 'Use "NOT" (uppercase) for logical NOT operator'
+            })
+        
+        return result
+    
+    def _tokenize_for_validation(self, query: str) -> List[str]:
+        """Simple tokenization for validation purposes"""
+        tokens = []
+        current = []
+        in_quotes = False
+        quote_char = None
+        
+        i = 0
+        while i < len(query):
+            char = query[i]
+            
+            if char in '"\'':
+                if not in_quotes:
+                    in_quotes = True
+                    quote_char = char
+                elif char == quote_char:
+                    in_quotes = False
+                    quote_char = None
+                current.append(char)
+            elif char.isspace() and not in_quotes:
+                if current:
+                    tokens.append(''.join(current))
+                    current = []
+            else:
+                current.append(char)
+            
+            i += 1
+        
+        if current:
+            tokens.append(''.join(current))
+        
+        return tokens
+    
+    def _parse_filter_token(self, token: str) -> Optional[Tuple[str, str, str]]:
+        """Parse a filter token into (field, operator, value)"""
+        # Try each operator pattern
+        patterns = [
+            (r'^(.+?)!=(.+)$', '!='),
+            (r'^(.+?)!~(.+)$', '!~'),
+            (r'^(.+?)>=(.+)$', '>='),
+            (r'^(.+?)<=(.+)$', '<='),
+            (r'^(.+?)=~(.+)$', '=~'),
+            (r'^(.+?)>(.+)$', '>'),
+            (r'^(.+?)<(.+)$', '<'),
+            (r'^(.+?)~(.+)$', '~'),
+            (r'^(.+?)=(.+)$', '='),
+            (r'^(.+?):(.+)$', ':'),
+        ]
+        
+        for pattern, op in patterns:
+            match = re.match(pattern, token)
+            if match:
+                field = match.group(1).strip()
+                value = match.group(2).strip().strip('"\'')
+                return (field, op, value)
+        
+        return None
+    
+    def _suggest_fields(self, partial: str, limit: int = 5) -> List[str]:
+        """Suggest field names based on partial input"""
+        partial_lower = partial.lower()
+        
+        # Exact prefix matches first
+        prefix_matches = [f for f in self.common_fields if f.lower().startswith(partial_lower)]
+        
+        # Then substring matches
+        substring_matches = [f for f in self.common_fields 
+                           if partial_lower in f.lower() and f not in prefix_matches]
+        
+        # Combine and limit
+        suggestions = prefix_matches + substring_matches
+        return suggestions[:limit]
+    
+    def get_field_suggestions(self, partial: str, discovered_fields: Dict = None) -> List[Dict]:
+        """
+        Get field suggestions for autocomplete
+        Returns list of {field, type, description, sample_values}
+        """
+        suggestions = []
+        partial_lower = partial.lower() if partial else ''
+        
+        # Combine common fields with discovered fields
+        all_fields = set(self.common_fields)
+        if discovered_fields:
+            all_fields.update(discovered_fields.keys())
+        
+        for field in sorted(all_fields):
+            if not partial or partial_lower in field.lower():
+                suggestion = {
+                    'field': field,
+                    'type': 'string',
+                    'description': self._get_field_description(field),
+                    'sample_values': self.field_values.get(field, [])[:5]
+                }
+                
+                # Add discovered field info
+                if discovered_fields and field in discovered_fields:
+                    info = discovered_fields[field]
+                    suggestion['type'] = info.get('type', 'string')
+                    suggestion['count'] = info.get('count', 0)
+                    if info.get('sample_values'):
+                        suggestion['sample_values'] = info['sample_values'][:5]
+                
+                suggestions.append(suggestion)
+        
+        # Sort by relevance
+        def sort_key(s):
+            field = s['field']
+            # Exact prefix match
+            if field.lower().startswith(partial_lower):
+                return (0, len(field), field)
+            # Contains match
+            return (1, len(field), field)
+        
+        suggestions.sort(key=sort_key)
+        return suggestions[:20]
+    
+    def _get_field_description(self, field: str) -> str:
+        """Get human-readable description for common fields"""
+        descriptions = {
+            'severity': 'Log severity level (INFO, WARN, ERROR, etc.)',
+            'level': 'Log level (same as severity)',
+            'time': 'Timestamp of the log entry',
+            'timestamp': 'Timestamp of the log entry',
+            'message': 'Main log message content',
+            'status': 'HTTP response status code',
+            'method': 'HTTP request method (GET, POST, etc.)',
+            'path': 'URL path of the request',
+            'duration_s': 'Total request duration in seconds',
+            'db_duration_s': 'Database query time in seconds',
+            'service': 'GitLab service component',
+            'correlation_id': 'Request correlation ID for tracing',
+            'user': 'Username or user ID',
+            'remote_ip': 'Client IP address',
+            'exception.class': 'Exception/error class name',
+            'exception.message': 'Exception/error message',
+            'gitaly_calls': 'Number of Gitaly RPC calls',
+            'redis_calls': 'Number of Redis operations',
+            'meta.feature_category': 'GitLab feature category'
+        }
+        return descriptions.get(field, '')
+    
+    def get_value_suggestions(self, field: str, partial: str = '', 
+                             discovered_fields: Dict = None) -> List[str]:
+        """Get value suggestions for a specific field"""
+        values = set()
+        
+        # Add known values
+        if field in self.field_values:
+            values.update(self.field_values[field])
+        
+        # Add discovered values
+        if discovered_fields and field in discovered_fields:
+            sample_values = discovered_fields[field].get('sample_values', [])
+            values.update(sample_values)
+        
+        # Filter by partial
+        if partial:
+            partial_lower = partial.lower()
+            values = [v for v in values if partial_lower in str(v).lower()]
+        
+        return sorted(values)[:20]
+
+
+# Add new API endpoint helper
+def create_query_validator(search_engine: PowerSearchEngine = None) -> QueryValidator:
+    """Factory function for QueryValidator"""
+    return QueryValidator(search_engine)
 
 
 def get_optimized_search_engine():

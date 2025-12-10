@@ -46,7 +46,6 @@ class SmartRunner:
             )
             version_str = result.stdout.strip()
             # Extract version numbers
-            import re
             match = re.search(r'(\d+)\.(\d+)', version_str)
             if match:
                 return (int(match.group(1)), int(match.group(2)))
@@ -156,7 +155,6 @@ class SmartRunner:
                 venv_version = venv_result.stdout.strip()
                 
                 # Extract major.minor version numbers
-                import re
                 current_match = re.search(r'(\d+\.\d+)', current_version)
                 venv_match = re.search(r'(\d+\.\d+)', venv_version)
                 
@@ -173,11 +171,14 @@ class SmartRunner:
         
         return False
     
+
+    
     def check_packages_installed(self):
         """Check if all required Python packages are installed"""
         if not Path(self.python).exists():
             return False
         
+        # Check core packages only
         test_script = """
 import sys
 try:
@@ -190,6 +191,7 @@ try:
     import uvicorn
     import websockets
     import psutil
+    import openai
     print("OK")
 except ImportError as e:
     print(f"MISSING:{e.name if hasattr(e, 'name') else str(e)}")
@@ -202,10 +204,12 @@ except Exception as e:
                 [self.python, "-c", test_script],
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=15
             )
             
             output = result.stdout.strip()
+            self.log_debug(f"Package check result: {output}")
+            
             if output == "OK":
                 return True
             elif output.startswith("MISSING:"):
@@ -220,7 +224,7 @@ except Exception as e:
                         print("   📝 Will install compatible version...")
                 return False
             else:
-                self.log_debug(f"Package check result: {output}")
+                self.log_debug(f"Unexpected check result: {output}")
                 return False
                 
         except subprocess.TimeoutExpired:
@@ -287,77 +291,85 @@ except Exception as e:
         self.log_debug(f"Using pandas spec: {pandas_spec}")
         self.log_debug(f"Using numpy spec: {numpy_spec}")
         
-        # List of required packages with dynamic versions
-        packages = [
-            "anyio==3.7.1",
-            "python-multipart",
-            "fastapi==0.104.1",
-            "uvicorn[standard]==0.24.0",
-            "aiohttp==3.12.14",
-            "aiofiles==23.2.1",
-            "websockets==12.0",
-            numpy_spec,  # Dynamic numpy version
-            pandas_spec,  # Dynamic pandas version
-            "python-dotenv",
-            "psutil==5.9.6"  # Memory monitoring for performance optimizations
+        # =====================================================================
+        # PHASE 1: Core dependencies
+        # =====================================================================
+        print("   📦 Phase 1/2: Core dependencies...")
+        phase1_packages = [
+            ("pydantic>=2.0,<3.0", "pydantic"),
+            ("anyio>=3.7.1,<5.0", "anyio"),
+            ("python-multipart", "python-multipart"),
+            ("starlette>=0.27.0", "starlette"),
+            ("fastapi>=0.104.0", "fastapi"),
+            ("uvicorn[standard]>=0.24.0", "uvicorn"),
         ]
         
-        # Install packages with progress
-        total = len(packages)
-        failed = []
-        
-        for i, pkg in enumerate(packages, 1):
-            pkg_name = pkg.split('==')[0].split('>=')[0].split('[')[0]
-            
+        for pkg_spec, pkg_name in phase1_packages:
             try:
                 if self.debug:
-                    print(f"   📦 Installing {pkg}... ({i}/{total})")
-                    result = subprocess.run([self.pip, "install", pkg])
-                    if result.returncode != 0:
-                        failed.append(pkg_name)
+                    subprocess.run([self.pip, "install", pkg_spec], timeout=120)
                 else:
-                    print(f"   📦 Installing {pkg_name}... ({i}/{total})", end='\r')
-                    result = subprocess.run([self.pip, "install", pkg], 
-                                          capture_output=True)
-                    if result.returncode != 0:
-                        failed.append(pkg_name)
+                    subprocess.run([self.pip, "install", pkg_spec], 
+                                 capture_output=True, timeout=120)
             except Exception as e:
-                self.log_debug(f"Failed to install {pkg}: {e}")
-                failed.append(pkg_name)
+                self.log_debug(f"Phase 1 - {pkg_name} error: {e}")
         
-        # Clear progress line in non-debug mode
-        if not self.debug:
-            print(" " * 60, end='\r')
+        # =====================================================================
+        # PHASE 2: Data and utility packages
+        # =====================================================================
+        print("   📦 Phase 2/2: Data libraries...")
+        phase2_packages = [
+            (numpy_spec, "numpy"),
+            (pandas_spec, "pandas"),
+            ("aiohttp>=3.9.0", "aiohttp"),
+            ("aiofiles>=23.2.1", "aiofiles"),
+            ("websockets>=12.0", "websockets"),
+            ("python-dotenv", "python-dotenv"),
+            ("psutil>=5.9.6", "psutil"),
+            ("scikit-learn>=1.0.0", "scikit-learn"),  # Required for LogGrep clustering
+        ]
+        
+        failed = []
+        for pkg_spec, pkg_name in phase2_packages:
+            try:
+                if self.debug:
+                    result = subprocess.run([self.pip, "install", pkg_spec], timeout=120)
+                else:
+                    result = subprocess.run([self.pip, "install", pkg_spec], 
+                                          capture_output=True, timeout=120)
+                if result.returncode != 0:
+                    failed.append(pkg_name)
+            except Exception as e:
+                self.log_debug(f"Phase 2 - {pkg_name} error: {e}")
+                failed.append(pkg_name)
         
         # Special handling for pandas failures on Python 3.13+
         if "pandas" in failed and py_version >= (3, 13):
             print("   ⚠️ Pandas installation failed - trying latest version...")
-            
-            # Try installing latest pandas without version constraint
             try:
                 if self.debug:
-                    print("   📦 Installing latest pandas...")
                     result = subprocess.run([self.pip, "install", "--upgrade", "pandas"])
                 else:
                     result = subprocess.run([self.pip, "install", "--upgrade", "pandas"], 
                                           capture_output=True)
-                
                 if result.returncode == 0:
                     failed.remove("pandas")
                     print("   ✅ Pandas installed successfully with latest version")
             except Exception as e:
                 self.log_debug(f"Alternate pandas install failed: {e}")
         
+        # =====================================================================
+        # Summary
+        # =====================================================================
         if failed:
             print(f"   ⚠️ Some packages failed: {', '.join(failed)}")
             print("   💡 Try running with --debug to see errors")
             
-            # Provide specific guidance for pandas on Python 3.13
             if "pandas" in failed and py_version >= (3, 13):
                 print("\n   📝 Note: Python 3.13 requires pandas 2.2.3 or newer")
                 print("   You may need to manually install: pip install 'pandas>=2.2.3'")
         else:
-            print("   ✅ Python packages installed")
+            print("   ✅ All Python packages installed")
         
         return len(failed) == 0
     
@@ -368,7 +380,7 @@ except Exception as e:
         # Show Python version info
         py_version = self.get_python_version()
         print(f"   📌 Python {py_version[0]}.{py_version[1]} detected")
-        
+
         # Check if venv exists
         venv_exists = Path("venv").exists()
         
@@ -416,15 +428,34 @@ except Exception as e:
         
         # Setup frontend if exists
         if Path("frontend").exists():
-            if not Path("frontend/node_modules").exists() or self.force_reinstall:
+            # Check if node_modules is valid by looking for key packages
+            node_modules_valid = False
+            if Path("frontend/node_modules").exists():
+                # Verify critical packages exist
+                critical_packages = ["react", "vite", "xterm"]
+                node_modules_valid = all(
+                    Path(f"frontend/node_modules/{pkg}").exists() 
+                    for pkg in critical_packages
+                )
+            
+            if not node_modules_valid or self.force_reinstall:
                 print("📦 Installing frontend packages...")
                 try:
+                    # Clean install if corrupted
+                    if not node_modules_valid and Path("frontend/node_modules").exists():
+                        self.log_debug("Cleaning corrupted node_modules...")
+                        shutil.rmtree("frontend/node_modules", ignore_errors=True)
+                    
                     if self.debug:
-                        subprocess.run(["npm", "install"], cwd="frontend")
+                        result = subprocess.run(["npm", "install"], cwd="frontend")
                     else:
-                        subprocess.run(["npm", "install"], cwd="frontend", 
+                        result = subprocess.run(["npm", "install"], cwd="frontend", 
                                      capture_output=True)
-                    print("   ✅ Frontend packages installed")
+                    
+                    if result.returncode == 0:
+                        print("   ✅ Frontend packages installed")
+                    else:
+                        print("   ⚠️ Frontend npm install had issues, continuing...")
                 except Exception as e:
                     print(f"   ⚠️ Frontend setup failed: {e}")
             else:
@@ -436,6 +467,7 @@ except Exception as e:
                          "backend/data/sessions"]:
             Path(dir_path).mkdir(parents=True, exist_ok=True)
         
+
         return True
     
     def start_backend(self):
@@ -534,6 +566,8 @@ except Exception as e:
         except Exception as e:
             print(f"   ⚠️ Failed to start MCP: {e}")
     
+
+    
     def monitor_frontend_output(self, proc):
         """Monitor frontend output to find the URL"""
         try:
@@ -542,7 +576,6 @@ except Exception as e:
                     if self.debug:
                         print(f"   🔧 [FRONTEND] {line.strip()}")
                     
-                    # Look for the URL in output
                     if "Local:" in line or "http://localhost:" in line:
                         match = re.search(r'http://localhost:(\d+)', line)
                         if match:
@@ -715,6 +748,7 @@ except Exception as e:
                 print("⚠️ MCP Server:   Starting...")
             sock.close()
         
+
         if frontend_url:
             print(f"✅ Frontend UI:  {frontend_url}")
         elif Path("frontend").exists():
@@ -789,12 +823,12 @@ Features:
   • Cross-platform support (Windows, Mac, Linux)
 
 Python Compatibility:
-  • Python 3.9-3.12: Uses pandas 2.1.3
-  • Python 3.13+: Automatically uses pandas 2.2.3+
-  • All versions handled automatically!
+  • Python 3.9-3.12: Full support ✅
+  • Python 3.13: Partial support
+  • Python 3.14+: Limited support
 
 Examples:
-  python start.py                      # Normal mode (auto-fixes everything)
+  python start.py                      # Normal mode
   python start.py --debug              # Show all logs
   python start.py --reinstall          # Force reinstall packages
   python start.py --debug --reinstall  # Both debug and reinstall
