@@ -25,7 +25,7 @@ class GitLabDuoChat:
     
     def __init__(self):
         self.gitlab_token = os.environ.get('GITLAB_TOKEN') or os.environ.get('GITLAB_PAT')
-        self.gitlab_url = os.environ.get('GITLAB_URL') or os.environ.get('GITLAB_INSTANCE_URL', 'https://gitlab.com')
+        self.gitlab_url = os.environ.get('GITLAB_INSTANCE_URL', 'https://gitlab.com')
         
         # Ensure URL format
         if self.gitlab_url and not self.gitlab_url.startswith(('http://', 'https://')):
