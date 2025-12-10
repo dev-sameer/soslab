@@ -5,8 +5,11 @@ Enhanced with GitLab-aware pattern matching using patterns_enhanced.json
 OPTIMIZED VERSION - Performance improvements for auto-analysis
 """
 
-from fastapi import FastAPI, UploadFile, WebSocket, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, WebSocket, HTTPException, BackgroundTasks, File, Body
+from starlette.websockets import WebSocketDisconnect
+import subprocess
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List
 from fastapi.responses import StreamingResponse
 import asyncio
 import json
@@ -53,11 +56,20 @@ except ImportError:
     FastStatsService = None
 
 # Import our modules
+from upload import router as upload_router
+from power_search.router import ps_router
+
 try:
     from gitlab_duo_chat import GitLabDuoChatIntegration
     from kubesos_analyzer import KubeSOSAnalyzer
     from mcp_unix_server import create_mcp_server
+    from mcp_unix_server import create_mcp_server
     from autogrep import AutoGrep
+
+    from autogrep import AutoGrep
+    from terminal_handler import terminal_manager, handle_terminal_websocket
+    from loggrep_engine import LogGrepEngine, create_loggrep_routes
+    from request_chain_tracer import RequestChainTracer, create_tracer_routes
     import threading
 except ImportError as e:
     print(f"⚠️  Some modules not available: {e}")
@@ -69,6 +81,16 @@ except ImportError as e:
     class KubeSOSAnalyzer:
         pass
     class AutoGrep:
+        pass
+    class LogGrepEngine:
+        def __init__(self, data_dir="data"):
+            self.data_dir = data_dir
+    class RequestChainTracer:
+        def __init__(self, session_manager):
+            pass
+    def create_loggrep_routes(app, engine):
+        pass
+    def create_tracer_routes(app, tracer):
         pass
     def create_mcp_server(base_dir="data/extracted"):
         from mcp_unix_server import UnixMCPServer
@@ -170,6 +192,70 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE"],  # Only methods you actually use
     allow_headers=["Content-Type", "Authorization"],  # Only headers you need
 )
+
+# LogGrep Engine
+loggrep_engine = LogGrepEngine(data_dir="data")
+create_loggrep_routes(app, loggrep_engine)
+
+# Request Chain Tracer
+request_chain_tracer = RequestChainTracer(session_manager=loggrep_engine.session_manager)
+create_tracer_routes(app, request_chain_tracer)
+
+# Register Terminal Routes
+@app.websocket("/ws/terminal/{session_id}")
+async def terminal_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint for terminal sessions"""
+    await handle_terminal_websocket(websocket, session_id)
+
+@app.websocket("/ws/terminal")
+async def terminal_default_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for default terminal session"""
+    import uuid
+    session_id = str(uuid.uuid4())
+    await handle_terminal_websocket(websocket, session_id)
+
+@app.get("/api/terminal/info")
+async def terminal_info():
+    """Get terminal info"""
+    return {
+        "base_dir": str(terminal_manager.base_dir.absolute()),
+        "active_sessions": len(terminal_manager.sessions),
+        "shell": os.environ.get("SHELL", "/bin/bash")
+    }
+
+@app.on_event("shutdown")
+async def shutdown_terminal():
+    """Cleanup terminal sessions on shutdown"""
+    """Cleanup terminal sessions on shutdown"""
+    terminal_manager.cleanup_all()
+
+# Slate API Endpoints
+@app.get("/api/slate")
+async def get_slate_api():
+    """Get slate contents via REST API"""
+    result = await get_slate()
+    return result
+
+@app.post("/api/slate")
+async def add_to_slate_api(entry: Dict = Body(...)):
+    """Add entry to slate via REST API"""
+    result = await add_to_slate(
+        title=entry.get('title', 'Note'),
+        content=entry.get('content', ''),
+        severity=entry.get('severity', 'info'),
+        source=entry.get('source', 'api'),
+        metadata=entry.get('metadata')
+    )
+    return result
+
+@app.delete("/api/slate")
+async def clear_slate_api():
+    """Clear slate via REST API"""
+    result = await clear_slate()
+    return result
+
+
+
 
 # Global state
 analysis_sessions = {}
@@ -2458,6 +2544,529 @@ async def analyze_sos_task(session_id: str, file_path: Path):
             "error": str(e)
         }
 
+async def extract_and_index_file(session_id: str, file_path: Path):
+    """Background task to extract and index a file added to a session"""
+    try:
+        session_dir = extracted_files[session_id]
+        
+        # Check if it's an archive
+        is_archive = any(file_path.name.lower().endswith(ext) for ext in ['.tar.gz', '.tgz', '.tar', '.zip', '.gz'])
+        
+        new_files_info = []
+        
+        if is_archive:
+            # Use analyzer's extraction logic
+            # We need to run this in a thread pool to not block
+            loop = asyncio.get_event_loop()
+            new_files_info = await loop.run_in_executor(
+                None, 
+                analyzer._extract_archive, 
+                file_path, 
+                session_dir
+            )
+        else:
+            # It's a single file, just add it
+            relative_path = file_path.name
+            
+            new_files_info.append({
+                'relative_path': relative_path,
+                'full_path': file_path,
+                'size': file_path.stat().st_size
+            })
+            
+        # Update session data
+        if session_id in analysis_sessions:
+            session_data = analysis_sessions[session_id]
+            
+            # Ensure log_files dict exists
+            if "log_files" not in session_data:
+                session_data["log_files"] = {}
+                
+            for file_info in new_files_info:
+                rel_path = file_info['relative_path']
+                full_path = Path(file_info['full_path'])
+                
+                # Identify service and type
+                service = analyzer._identify_service(rel_path)
+                file_type = analyzer._identify_file_type(full_path)
+                is_suitable = analyzer._is_suitable_for_analysis(full_path)
+                
+                file_entry = {
+                    "path": rel_path,
+                    "full_path": str(full_path),
+                    "size": file_info['size'],
+                    "service": service,
+                    "is_suitable": is_suitable,
+                    "file_type": file_type,
+                    "parent_dir": rel_path.split('/')[-2] if '/' in rel_path and len(rel_path.split('/')) > 1 else None
+                }
+                
+                if is_suitable:
+                    line_count = analyzer._get_line_count(full_path)
+                    file_entry["lines"] = line_count
+                    session_data["total_lines"] += line_count
+                    if "suitable_files" in session_data["analysis_info"]:
+                        session_data["analysis_info"]["suitable_files"].append(rel_path)
+                else:
+                    if "static_files" in session_data["analysis_info"]:
+                        session_data["analysis_info"]["static_files"].append(rel_path)
+                
+                session_data["log_files"][rel_path] = file_entry
+                
+            session_data["total_files"] = len(session_data["log_files"])
+            
+            # Update context for Duo Chat
+            if hasattr(duo_chat, 'add_session_context'):
+                duo_chat.add_session_context(session_id, session_data)
+                
+    except Exception as e:
+        print(f"❌ Error adding file to session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
+@app.post("/api/sessions/custom/create")
+async def create_custom_session():
+    """Create a new custom session for individual file uploads"""
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    session_id = f"custom_{timestamp}"
+    
+    session_dir = Path("data/extracted") / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create the full analysis structure
+    analysis_data = {
+        "session_id": session_id,
+        "status": "completed",  # IMPORTANT: Must be completed
+        "type": "custom",
+        "files_processed": 0,
+        "total_files": 0,
+        "total_lines": 0,
+        "patterns": {},
+        "anomalies": [],
+        "log_files": {},
+        "analysis_info": {
+            "suitable_files": [],
+            "static_files": [],
+            "is_custom_session": True
+        },
+        "component_analysis": {},
+        "enhanced_status": "not_available",
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Store in both places
+    analysis_sessions[session_id] = analysis_data
+    extracted_files[session_id] = session_dir
+    
+    print(f"✨ Created custom session: {session_id}")
+    
+    # Return the FULL analysis data so frontend can use it immediately
+    return analysis_data
+
+@app.delete("/api/sessions/{session_id}/files/{file_path:path}")
+async def remove_file_from_session(session_id: str, file_path: str):
+    """Remove a file from a session"""
+    
+    print(f"🗑️ Remove file request: {file_path} from session {session_id}")
+    
+    # Get session directory
+    session_dir = None
+    if session_id in extracted_files:
+        session_dir = extracted_files[session_id]
+    else:
+        potential_dir = Path("data/extracted") / session_id
+        if potential_dir.exists():
+            session_dir = potential_dir
+    
+    if not session_dir or not session_dir.exists():
+        raise HTTPException(404, f"Session not found: {session_id}")
+    
+    # Build full path
+    full_path = session_dir / file_path
+    
+    # Security check - make sure path is within session dir
+    try:
+        full_path.resolve().relative_to(session_dir.resolve())
+    except ValueError:
+        raise HTTPException(400, "Invalid file path")
+    
+    if not full_path.exists():
+        raise HTTPException(404, f"File not found: {file_path}")
+    
+    # Delete the file
+    try:
+        full_path.unlink()
+        print(f"   ✅ Deleted: {full_path}")
+        
+        # Clean up empty parent directories (only within added_files or added_*)
+        parent = full_path.parent
+        while parent != session_dir:
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+                print(f"   🧹 Removed empty dir: {parent.name}")
+            parent = parent.parent
+            
+    except Exception as e:
+        print(f"   ❌ Error deleting: {e}")
+        raise HTTPException(500, f"Failed to delete file: {str(e)}")
+    
+    # Update analysis_sessions
+    if session_id in analysis_sessions:
+        session_data = analysis_sessions[session_id]
+        if 'log_files' in session_data and file_path in session_data['log_files']:
+            del session_data['log_files'][file_path]
+            session_data['total_files'] = len(session_data['log_files'])
+            session_data['total_lines'] = sum(
+                f.get('lines', 0) for f in session_data['log_files'].values()
+            )
+            if 'analysis_info' in session_data and 'suitable_files' in session_data['analysis_info']:
+                if file_path in session_data['analysis_info']['suitable_files']:
+                    session_data['analysis_info']['suitable_files'].remove(file_path)
+    
+    return {
+        "status": "deleted",
+        "file": file_path,
+        "session_id": session_id
+    }
+
+@app.post("/api/sessions/{session_id}/add-files")
+async def add_files_to_session(
+    session_id: str,
+    files: List[UploadFile] = File(...)
+):
+    """Add individual files or archives to an existing session - SYNCHRONOUS VERSION"""
+    
+    print(f"📥 Add files request for session: {session_id}")
+    print(f"   Files received: {[f.filename for f in files]}")
+    
+    # Check if session exists
+    if session_id not in extracted_files:
+        print(f"❌ Session not found in extracted_files: {session_id}")
+        raise HTTPException(404, f"Session not found: {session_id}")
+    
+    session_dir = extracted_files[session_id]
+    print(f"   Session dir: {session_dir}")
+    
+    if not session_dir.exists():
+        print(f"❌ Session directory doesn't exist: {session_dir}")
+        raise HTTPException(404, f"Session directory not found")
+    
+    added_files = []
+    archive_extensions = {'.tar', '.tar.gz', '.tgz', '.zip', '.gz'}
+    
+    for file in files:
+        filename = file.filename
+        file_lower = filename.lower()
+        print(f"   Processing file: {filename}")
+        
+        is_archive = any(file_lower.endswith(ext) for ext in archive_extensions)
+        
+        try:
+            content = await file.read()
+            print(f"   Read {len(content)} bytes")
+            
+            if is_archive:
+                added = await _extract_and_add_archive_to_session(
+                    session_id, session_dir, filename, content
+                )
+                added_files.extend(added)
+            else:
+                added = await _add_individual_file_to_session(
+                    session_id, session_dir, filename, content
+                )
+                added_files.append(added)
+                
+        except Exception as e:
+            print(f"❌ Error adding file {filename}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    print(f"✅ Added {len(added_files)} files")
+    
+    # SYNCHRONOUSLY update the session (not in background)
+    if added_files:
+        await _update_session_with_new_files_sync(session_id, session_dir, added_files)
+    
+    # Return updated analysis data
+    updated_analysis = analysis_sessions.get(session_id, {})
+    
+    return {
+        "session_id": session_id,
+        "files_added": len(added_files),
+        "added_files": [f['relative_path'] for f in added_files],
+        "status": "completed",
+        "total_files": updated_analysis.get('total_files', 0),
+        "log_files": updated_analysis.get('log_files', {})
+    }
+
+
+async def _add_individual_file_to_session(
+    session_id: str,
+    session_dir: Path,
+    filename: str,
+    content: bytes
+) -> Dict:
+    """Add an individual file to the session"""
+    
+    # Create 'added_files' subdirectory
+    added_dir = session_dir / "added_files"
+    added_dir.mkdir(exist_ok=True)
+    
+    # Handle filename conflicts
+    target_path = added_dir / filename
+    original_filename = filename
+    
+    if target_path.exists():
+        name_parts = filename.rsplit('.', 1)
+        timestamp = datetime.now().strftime('%H%M%S')
+        if len(name_parts) > 1:
+            filename = f"{name_parts[0]}_{timestamp}.{name_parts[1]}"
+        else:
+            filename = f"{filename}_{timestamp}"
+        target_path = added_dir / filename
+    
+    # Write file
+    with open(target_path, 'wb') as f:
+        f.write(content)
+    
+    print(f"📄 Wrote file: {target_path}")
+    
+    return {
+        'relative_path': f"added_files/{filename}",
+        'full_path': target_path,
+        'size': len(content),
+        'source': 'individual',
+        'original_name': original_filename
+    }
+
+
+async def _extract_and_add_archive_to_session(
+    session_id: str, 
+    session_dir: Path, 
+    filename: str, 
+    content: bytes
+) -> List[Dict]:
+    """Extract archive and add contents"""
+    
+    import tempfile
+    extracted_files_list = []
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=filename) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    
+    try:
+        archive_name = Path(filename).stem
+        if filename.lower().endswith('.tar.gz'):
+            archive_name = filename[:-7]
+        
+        extract_subdir = session_dir / f"added_{archive_name}"
+        extract_subdir.mkdir(parents=True, exist_ok=True)
+        
+        filename_lower = filename.lower()
+        
+        if filename_lower.endswith('.tar.gz') or filename_lower.endswith('.tgz'):
+            with tarfile.open(tmp_path, 'r:gz') as tar:
+                for member in tar.getmembers():
+                    if member.isfile() and not member.name.startswith('._'):
+                        tar.extract(member, extract_subdir)
+                        extracted_files_list.append({
+                            'relative_path': f"added_{archive_name}/{member.name}",
+                            'full_path': extract_subdir / member.name,
+                            'size': member.size,
+                            'source': 'archive'
+                        })
+        
+        elif filename_lower.endswith('.tar'):
+            with tarfile.open(tmp_path, 'r') as tar:
+                for member in tar.getmembers():
+                    if member.isfile() and not member.name.startswith('._'):
+                        tar.extract(member, extract_subdir)
+                        extracted_files_list.append({
+                            'relative_path': f"added_{archive_name}/{member.name}",
+                            'full_path': extract_subdir / member.name,
+                            'size': member.size,
+                            'source': 'archive'
+                        })
+        
+        elif filename_lower.endswith('.zip'):
+            with zipfile.ZipFile(tmp_path) as zf:
+                for info in zf.infolist():
+                    if not info.is_dir() and not info.filename.startswith('._'):
+                        zf.extract(info, extract_subdir)
+                        extracted_files_list.append({
+                            'relative_path': f"added_{archive_name}/{info.filename}",
+                            'full_path': extract_subdir / info.filename,
+                            'size': info.file_size,
+                            'source': 'archive'
+                        })
+        
+        print(f"📦 Extracted {len(extracted_files_list)} files from {filename}")
+        
+    finally:
+        try:
+            tmp_path.unlink()
+        except:
+            pass
+    
+    return extracted_files_list
+
+
+async def _update_session_with_new_files_sync(
+    session_id: str,
+    session_dir: Path,
+    new_files: List[Dict]
+):
+    """SYNCHRONOUSLY update session with new files"""
+    
+    print(f"🔄 Updating session {session_id} with {len(new_files)} new files")
+    
+    if session_id not in analysis_sessions:
+        print(f"⚠️ Session not in analysis_sessions, creating...")
+        analysis_sessions[session_id] = {
+            "session_id": session_id,
+            "status": "completed",
+            "log_files": {},
+            "analysis_info": {"suitable_files": [], "static_files": []},
+            "total_files": 0,
+            "total_lines": 0,
+            "files_processed": 0,
+            "patterns": {},
+            "anomalies": []
+        }
+    
+    session_data = analysis_sessions[session_id]
+    
+    for file_info in new_files:
+        relative_path = file_info['relative_path']
+        full_path = Path(file_info['full_path'])
+        
+        if not full_path.exists():
+            print(f"⚠️ File doesn't exist: {full_path}")
+            continue
+        
+        # Count lines
+        line_count = 0
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                line_count = sum(1 for _ in f)
+        except:
+            pass
+        
+        # Identify service
+        path_lower = relative_path.lower()
+        service = 'other'
+        for svc, patterns in {
+            'gitlab-rails': ['gitlab-rails', 'production', 'api_json'],
+            'sidekiq': ['sidekiq'],
+            'gitaly': ['gitaly'],
+            'praefect': ['praefect'],
+            'nginx': ['nginx', 'access.log', 'error.log'],
+            'postgresql': ['postgresql', 'postgres'],
+            'redis': ['redis'],
+            'system': ['syslog', 'messages', 'dmesg']
+        }.items():
+            if any(p in path_lower for p in patterns):
+                service = svc
+                break
+        
+        # Add to log_files
+        session_data['log_files'][relative_path] = {
+            "path": relative_path,
+            "full_path": str(full_path),
+            "size": file_info['size'],
+            "lines": line_count,
+            "service": service,
+            "is_suitable": True,
+            "added_at": datetime.now().isoformat()
+        }
+        
+        # Update suitable files list
+        if 'analysis_info' not in session_data:
+            session_data['analysis_info'] = {'suitable_files': [], 'static_files': []}
+        if relative_path not in session_data['analysis_info']['suitable_files']:
+            session_data['analysis_info']['suitable_files'].append(relative_path)
+        
+        print(f"   ✅ Indexed: {relative_path} ({line_count} lines)")
+    
+    # Update totals
+    session_data['total_files'] = len(session_data['log_files'])
+    session_data['total_lines'] = sum(f.get('lines', 0) for f in session_data['log_files'].values())
+    session_data['files_processed'] = session_data['total_files']
+    session_data['status'] = 'completed'
+    session_data['last_updated'] = datetime.now().isoformat()
+    
+    print(f"✅ Session updated: {session_data['total_files']} files, {session_data['total_lines']} lines")
+
+
+def _identify_service_for_file(relative_path: str) -> str:
+    """Identify GitLab service from file path - same logic as analyzer"""
+    path_lower = relative_path.lower()
+    
+    service_patterns = {
+        'gitlab-rails': ['gitlab-rails', 'production.log', 'api_json', 'application.log'],
+        'sidekiq': ['sidekiq'],
+        'gitaly': ['gitaly'],
+        'praefect': ['praefect'],
+        'nginx': ['nginx', 'access.log', 'error.log'],
+        'postgresql': ['postgresql', 'postgres'],
+        'redis': ['redis'],
+        'registry': ['registry'],
+        'workhorse': ['workhorse'],
+        'shell': ['gitlab-shell', 'shell'],
+        'pages': ['gitlab-pages', 'pages'],
+        'consul': ['consul'],
+        'prometheus': ['prometheus'],
+        'alertmanager': ['alertmanager'],
+        'grafana': ['grafana'],
+        'system': ['syslog', 'messages', 'dmesg', 'kern.log', 'auth.log']
+    }
+    
+    for service, patterns in service_patterns.items():
+        if any(p in path_lower for p in patterns):
+            return service
+    
+    return 'other'
+
+
+def _identify_file_type_for_file(file_path: Path) -> str:
+    """Identify file type - same logic as analyzer"""
+    name = file_path.name.lower()
+    
+    if name.endswith('.json') or 'json' in name:
+        return 'json_log'
+    elif name.endswith('.log'):
+        return 'text_log'
+    elif name == 'current' or name == 'state':
+        return 'svlog'
+    elif name.endswith(('.yml', '.yaml', '.conf', '.cfg', '.ini')):
+        return 'config'
+    elif name.endswith(('.sh', '.bash', '.py', '.rb')):
+        return 'script'
+    else:
+        return 'other'
+
+
+@app.get("/api/sessions/{session_id}/info")
+async def get_session_info(session_id: str):
+    """Get session info"""
+    if session_id not in analysis_sessions:
+        raise HTTPException(404, "Session not found")
+    return analysis_sessions[session_id]
+
+@app.post("/api/sessions/{session_id}/refresh")
+async def refresh_session(session_id: str):
+    """Refresh session file list"""
+    if session_id not in extracted_files:
+        raise HTTPException(404, "Session not found")
+        
+    if session_id in analysis_sessions:
+        return analysis_sessions[session_id]
+        
+    return {"status": "error", "message": "Session not in memory"}
+
 @app.get("/api/analysis/{session_id}")
 async def get_analysis(session_id: str):
     """Get analysis results"""
@@ -2773,6 +3382,7 @@ async def health_check():
         "sessions": len(analysis_sessions)
     }
 
+# Power Search endpoints
 # GitLab Duo Chat endpoints  
 @app.post("/api/duo/chat")
 async def duo_chat_message(request: dict):
@@ -2802,77 +3412,149 @@ async def duo_chat_message(request: dict):
     except Exception as e:
         raise HTTPException(500, f"Chat error: {str(e)}")
 
+
+# =============================================================================
+# WEBSOCKET ENDPOINT - STREAMING DUO CHAT
+# =============================================================================
+
 @app.websocket("/ws/duo/{session_id}")
 async def duo_chat_stream(websocket: WebSocket, session_id: str):
     """WebSocket endpoint for streaming Duo Chat responses"""
     await websocket.accept()
     print(f"✅ Duo Chat WebSocket connected for session: {session_id}")
     
+    is_closed = False
+    
+    async def safe_send(data: dict) -> bool:
+        """Send JSON only if connection is still open"""
+        nonlocal is_closed
+        if is_closed:
+            return False
+        try:
+            await websocket.send_json(data)
+            return True
+        except Exception as e:
+            print(f"⚠️ Send failed (connection closed): {e}")
+            is_closed = True
+            return False
+    
     try:
-        while True:
-            # Receive message from client
-            data = await websocket.receive_json()
-            print(f"📨 Received from client: {data}")
-            
-            if data['type'] == 'chat':
-                try:
-                    # Send to Duo using hybrid approach
-                    result = await duo_chat.send_chat_message(
-                        message=data['message'],
-                        session_id=session_id,
-                        thread_id=data.get('thread_id')
-                    )
-                    print(f"✅ Duo Chat result: {result}")
+        while not is_closed:
+            try:
+                # Receive message from client
+                data = await websocket.receive_json()
+                print(f"📨 Received from client: {data}")
+                
+                msg_type = data.get('type', '')
+                
+                if msg_type == 'chat':
+                    message = data.get('message', '').strip()
+                    thread_id = data.get('thread_id')
+                    use_streaming = data.get('stream', True)
                     
-                    # With REST API, we get immediate response
-                    if 'response' in result:
-                        # Send the complete response
-                        await websocket.send_json({
-                            'type': 'response',
-                            'content': result['response'],
-                            'thread_id': result.get('threadId')
-                        })
+                    if not message:
+                        await safe_send({'type': 'error', 'content': 'Empty message'})
+                        continue
+                    
+                    try:
+                        # Try streaming first (preferred)
+                        if use_streaming and hasattr(duo_chat, 'stream_message'):
+                            print(f"🔄 Using streaming for: {message[:50]}...")
+                            async for event in duo_chat.stream_message(
+                                message=message,
+                                session_id=session_id,
+                                thread_id=thread_id
+                            ):
+                                # Send each event to the frontend
+                                print(f"📤 Sending {event.get('type')}: {len(event.get('content', ''))} chars")
+                                if not await safe_send(event):
+                                    print("⚠️ Client disconnected during stream")
+                                    break
                         
-                        # Send completion immediately
-                        await websocket.send_json({
-                            'type': 'complete',
-                            'thread_id': result.get('threadId')
-                        })
-                    else:
-                        # Fallback behavior if REST not available
-                        await websocket.send_json({
-                            'type': 'response',
-                            'content': "Message sent to GitLab Duo Chat. Response retrieval not available via API.",
-                            'thread_id': result.get('threadId')
-                        })
+                        # Fallback to non-streaming
+                        elif hasattr(duo_chat, 'send_chat_message'):
+                            print(f"📤 Using non-streaming for: {message[:50]}...")
+                            result = await duo_chat.send_chat_message(
+                                message=message,
+                                session_id=session_id,
+                                thread_id=thread_id
+                            )
+                            print(f"✅ Duo Chat result: {result}")
+                            
+                            # Send response
+                            response_content = result.get('response', '')
+                            if response_content:
+                                await safe_send({
+                                    'type': 'response',
+                                    'content': response_content,
+                                    'threadId': result.get('threadId'),
+                                    'requestId': result.get('requestId')
+                                })
+                            
+                            # Send completion
+                            await safe_send({
+                                'type': 'complete',
+                                'content': response_content,
+                                'threadId': result.get('threadId'),
+                                'requestId': result.get('requestId')
+                            })
                         
-                        await websocket.send_json({
-                            'type': 'complete',
-                            'thread_id': result.get('threadId')
+                        # No suitable method available
+                        else:
+                            await safe_send({
+                                'type': 'error',
+                                'content': 'Duo Chat not properly initialized'
+                            })
+                            
+                    except Exception as e:
+                        print(f"❌ Chat error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        await safe_send({
+                            'type': 'error',
+                            'content': f"Chat error: {str(e)}"
                         })
+                
+                elif msg_type == 'ping':
+                    await safe_send({'type': 'pong'})
+                
+                elif msg_type == 'clear':
+                    # Clear thread for new conversation
+                    if hasattr(duo_chat, 'clear_session'):
+                        duo_chat.clear_session(session_id)
+                    await safe_send({'type': 'cleared', 'session_id': session_id})
                     
-                except Exception as e:
-                    print(f"❌ Error: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    
-                    await websocket.send_json({
-                        'type': 'error',
-                        'message': f"Chat error: {str(e)}"
-                    })
-            
+            except WebSocketDisconnect:
+                print(f"🔌 Client disconnected: {session_id}")
+                is_closed = True
+                break
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Invalid JSON received: {e}")
+                await safe_send({'type': 'error', 'content': 'Invalid JSON'})
+                
     except Exception as e:
-        print(f"❌ WebSocket error: {str(e)}")
+        print(f"❌ WebSocket error: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        print("🔌 WebSocket connection closed")
-        await websocket.close()
+        is_closed = True
+        print(f"🔌 WebSocket handler finished: {session_id}")
+        # NOTE: Do NOT call websocket.close() here!
+        # It causes "RuntimeError: Unexpected ASGI message 'websocket.close'"
+        # when the client has already disconnected
+
+
+# =============================================================================
+# REST ENDPOINTS - DUO CHAT
+# =============================================================================
 
 @app.get("/api/duo/conversations/{session_id}")
 async def get_conversations(session_id: str):
     """Get all conversations for a session"""
-    return duo_chat.load_conversations(session_id)
+    if hasattr(duo_chat, 'load_conversations'):
+        return duo_chat.load_conversations(session_id)
+    return []
+
 
 @app.post("/api/duo/context")
 async def update_context(request: dict):
@@ -2880,29 +3562,52 @@ async def update_context(request: dict):
     session_id = request.get('session_id')
     
     if not session_id:
-        raise HTTPException(400, "session_id required")
+        raise HTTPException(status_code=400, detail="session_id required")
     
     # Check if we have analysis data for this session
     if session_id in analysis_sessions:
-        duo_chat.add_session_context(session_id, analysis_sessions[session_id])
-        return {"status": "context updated", "session_id": session_id}
+        if hasattr(duo_chat, 'add_session_context'):
+            duo_chat.add_session_context(session_id, analysis_sessions[session_id])
+            return {"status": "context updated", "session_id": session_id}
+        else:
+            return {"status": "context method not available", "session_id": session_id}
     
     return {"status": "no analysis data found", "session_id": session_id}
+
 
 @app.post("/api/duo/search-suggestion")
 async def get_search_suggestion(request: dict):
     """Get Power Search query suggestion from natural language"""
-    
-    query = request.get('query')
+    query = request.get('query', '')
     session_id = request.get('session_id')
     
-    context = duo_chat.session_contexts.get(session_id, {})
-    suggestion = duo_chat.create_log_search_query(query, context)
+    # Get context if available
+    context = {}
+    if hasattr(duo_chat, 'session_contexts'):
+        context = duo_chat.session_contexts.get(session_id, {})
+    
+    # Generate suggestion
+    if hasattr(duo_chat, 'create_log_search_query'):
+        suggestion = duo_chat.create_log_search_query(query, context)
+    else:
+        suggestion = query  # Passthrough if method not available
     
     return {
         'original': query,
         'suggestion': suggestion,
         'context_available': bool(context)
+    }
+
+
+@app.get("/api/duo/status")
+async def duo_status():
+    """Check Duo Chat status and capabilities"""
+    return {
+        'available': duo_chat is not None,
+        'streaming': hasattr(duo_chat, 'stream_message'),
+        'legacy': hasattr(duo_chat, 'send_chat_message'),
+        'context': hasattr(duo_chat, 'add_session_context'),
+        'search': hasattr(duo_chat, 'create_log_search_query')
     }
 
 # Fast-stats endpoints
@@ -3346,13 +4051,22 @@ async def run_auto_analysis_task_improved(session_id: str):
         # Find the file
         upload_path = Path("data/uploads")
         original_file = None
+        is_custom_session = False
+        session_dir = None
+        
         for file in upload_path.iterdir():
             if session_id in file.name and file.is_file():
                 original_file = file
                 break
         
         if not original_file:
-            raise Exception(f"Original file not found for session {session_id}")
+            # Check if this is a custom session (directory-based, no tar)
+            session_dir = Path("data/extracted") / session_id
+            if session_dir.exists() and session_dir.is_dir():
+                is_custom_session = True
+                print(f"📁 Custom session detected: {session_dir}")
+            else:
+                raise Exception(f"Original file not found for session {session_id}")
         
         # Create progress monitoring task
         progress_queue_id = analysis_id
@@ -3389,15 +4103,22 @@ async def run_auto_analysis_task_improved(session_id: str):
         # Start progress monitoring
         monitor_task = create_task(monitor_progress())
         
-        # Run analysis in separate process - THIS WON'T BLOCK
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            process_pool,
-            run_analysis_in_process,
-            str(original_file),
-            session_id,
-            progress_queue_id
-        )
+        # Run analysis
+        if is_custom_session:
+            # Custom session - run directory analysis directly
+            optimal_workers = min(mp.cpu_count(), 8)
+            analyzer_instance = AutoGrep(workers=optimal_workers)
+            result = await analyzer_instance.analyze_directory_streaming(str(session_dir))
+        else:
+            # Regular SOS - run in separate process
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                process_pool,
+                run_analysis_in_process,
+                str(original_file),
+                session_id,
+                progress_queue_id
+            )
         
         # Analysis completed
         monitor_task.cancel()
@@ -3592,14 +4313,24 @@ async def run_auto_analysis_task(session_id: str):
                 original_file = file
                 break
         
-        if not original_file:
-            raise Exception(f"Original uploaded file not found for session {session_id}")
+        # Check if this is a custom session (no tar file, just directory)
+        is_custom_session = False
+        session_dir = None
         
-        print(f"📦 Using original upload: {original_file.name}")
+        if not original_file:
+            # Try custom session - check if directory exists
+            session_dir = Path("data/extracted") / session_id
+            if session_dir.exists() and session_dir.is_dir():
+                is_custom_session = True
+                print(f"📁 Custom session detected: {session_dir}")
+            else:
+                raise Exception(f"Original uploaded file not found for session {session_id}")
+        else:
+            print(f"📦 Using original upload: {original_file.name}")
         
         auto_analysis_sessions[session_id].update({
             "progress": 20,
-            "message": "📦 Extracting archive..."
+            "message": "📁 Analyzing files..." if is_custom_session else "📦 Extracting archive..."
         })
         
         print(f"🎯 Initializing AutoGrep...")
@@ -3620,7 +4351,11 @@ async def run_auto_analysis_task(session_id: str):
             "message": "⚡ Processing files with parallel workers..."
         })
         
-        report = await analyzer.analyze_tar_streaming(str(original_file))
+        # Use appropriate analysis method based on session type
+        if is_custom_session:
+            report = await analyzer.analyze_directory_streaming(str(session_dir))
+        else:
+            report = await analyzer.analyze_tar_streaming(str(original_file))
         analysis_duration = time.time() - start_time
         print(f"✅ Pattern analysis completed in {analysis_duration:.1f}s")
         
@@ -3996,8 +4731,12 @@ async def websocket_duo_endpoint(websocket: WebSocket, session_id: str):
 
 
 @app.post("/api/auto-analysis/{session_id}/duo-rest-analyze")
-async def start_duo_rest_analysis(session_id: str, background_tasks: BackgroundTasks):
-    """Start Duo analysis using REST API with batching"""
+async def start_duo_rest_analysis(
+    session_id: str, 
+    background_tasks: BackgroundTasks,
+    request_body: Dict = Body(default={})
+):
+    """Start Duo analysis using REST API with batching - supports selective analysis"""
     
     # Validate prerequisites
     if not duo_rest_analyzer or not duo_rest_analyzer.enabled:
@@ -4008,6 +4747,9 @@ async def start_duo_rest_analysis(session_id: str, background_tasks: BackgroundT
     
     if auto_analysis_sessions[session_id].get('status') != 'completed':
         raise HTTPException(400, "Auto-analysis must complete first")
+    
+    # Extract selected_indices from request body if provided
+    selected_indices = request_body.get('selected_indices') if request_body else None
     
     # Check for existing analysis
     existing = duo_rest_analyzer.get_session_status(session_id)
@@ -4021,7 +4763,8 @@ async def start_duo_rest_analysis(session_id: str, background_tasks: BackgroundT
     background_tasks.add_task(
         run_duo_rest_analysis,
         session_id,
-        auto_analysis_sessions[session_id]['results']
+        auto_analysis_sessions[session_id]['results'],
+        selected_indices  # Pass selected indices to background task
     )
     
     return {
@@ -4031,8 +4774,8 @@ async def start_duo_rest_analysis(session_id: str, background_tasks: BackgroundT
     }
 
 
-async def run_duo_rest_analysis(session_id: str, analysis_results: Dict):
-    """Background task for REST API Duo analysis"""
+async def run_duo_rest_analysis(session_id: str, analysis_results: Dict, selected_indices: Optional[List[int]] = None):
+    """Background task for REST API Duo analysis with selective support"""
     try:
         # Extract error groups
         error_groups = analysis_results.get('problems', [])
@@ -4042,10 +4785,18 @@ async def run_duo_rest_analysis(session_id: str, analysis_results: Dict):
         if not error_groups:
             raise Exception("No error patterns found in analysis results")
         
-        print(f"🤖 Starting GitLab Duo REST API analysis for {len(error_groups)} patterns...")
+        # Log what we're analyzing
+        if selected_indices and len(selected_indices) > 0:
+            print(f"🎯 Starting selective GitLab Duo REST API analysis for {len(selected_indices)} of {len(error_groups)} patterns...")
+        else:
+            print(f"🤖 Starting GitLab Duo REST API analysis for all {len(error_groups)} patterns...")
         
-        # Run analysis with batching
-        result = await duo_rest_analyzer.analyze_errors_with_batching(session_id, error_groups)
+        # Run analysis with batching and selected indices
+        result = await duo_rest_analyzer.analyze_errors_with_batching(
+            session_id, 
+            error_groups,
+            selected_indices=selected_indices
+        )
         
         # Store result in session
         if session_id in auto_analysis_sessions:
@@ -4963,18 +5714,136 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 app.include_router(upload_router.router)
 app.include_router(ps_router)
 
+# =============================================================================
+# GitLab Duo Chat Model Selection Routes
+# =============================================================================
+
+@app.get("/api/duo/models")
+async def get_available_models():
+    """Get available AI models for Duo Chat"""
+    if not duo_chat.enabled:
+        return {
+            "availableModels": [],
+            "defaultModel": None,
+            "error": "GitLab Duo Chat is not configured"
+        }
+    
+    try:
+        models_data = await duo_chat.get_available_models()
+        return {
+            "availableModels": models_data.get('availableModels', []),
+            "defaultModel": models_data.get('defaultModel'),
+            "error": models_data.get('error')
+        }
+    except Exception as e:
+        print(f"Error fetching models: {e}")
+        return {
+            "availableModels": [],
+            "defaultModel": None,
+            "error": str(e)
+        }
+
+@app.post("/api/duo/model-selection")
+async def update_model_selection(request: Dict = Body(...)):
+    """Update model selection for Duo Chat"""
+    if not duo_chat.enabled:
+        return {
+            "success": False,
+            "error": "GitLab Duo Chat is not configured"
+        }
+    
+    try:
+        model_ref = request.get('model_ref')
+        namespace_id = request.get('namespace_id')
+        
+        if not model_ref or not namespace_id:
+            return {
+                "success": False,
+                "error": "Missing model_ref or namespace_id"
+            }
+        
+        result = await duo_chat.update_model_selection(namespace_id, model_ref)
+        return result
+    except Exception as e:
+        print(f"Error updating model selection: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+# =============================================================================
+# Terminal WebSocket Routes
+# =============================================================================
+
+@app.websocket("/ws/terminal/{session_id}")
+async def terminal_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint for terminal sessions"""
+    await handle_terminal_websocket(websocket, session_id)
+
+@app.websocket("/ws/terminal")
+async def terminal_default_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for default terminal session"""
+    session_id = str(uuid.uuid4())
+    await handle_terminal_websocket(websocket, session_id)
+
+@app.get("/api/terminal/info")
+async def terminal_info():
+    """Get terminal info - working directory for terminal"""
+    return {
+        "base_dir": str(Path("data/extracted").absolute()),
+        "active_sessions": len(terminal_manager.sessions),
+        "shell": os.environ.get("SHELL", "/bin/bash")
+    }
+
+
+
+app.include_router(upload_router.router)
+app.include_router(ps_router)
+
 if __name__ == "__main__":
+    # Start agent server in background
+    # We assume we are running from the backend directory
+    agent_script = "agent_server.py"
+    if not Path(agent_script).exists():
+        # Fallback if running from root
+        agent_script = "backend/agent_server.py"
+    
+    agent_process = None
+    if Path(agent_script).exists():
+        try:
+            import subprocess
+            agent_process = subprocess.Popen(
+                [sys.executable, agent_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"⚠️  Failed to start agent server: {e}")
+
     ensure_localhost_only()
     import uvicorn
 
     safe_restore_sessions()
     
-    print("🚀 Starting GitLab SOS Analyzer v5.3.0 - OPTIMIZED")
+    print("🚀 Starting GitLab SOS Analyzer v5.3.0 - WITH AGENT")
     print("✨ Features: Pattern Analysis, Power Search, GitLab Duo Chat, KubeSOS Support")
-    print("⚡ Performance: Optimized for faster auto-analysis")
+    print("🤖 AGENT READY: GPT-OSS powered intelligent assistant")
     print("📂 Web UI at http://localhost:8000")
+    print("🔌 Agent WebSocket at ws://localhost:8001/ws/agent")
     print("\n⚠️  Note: MCP Server must be run separately")
     print("   Run 'python run_mcp.py' in another terminal for GitLab Duo MCP support")
     
-    # CRITICAL: Change this to 127.0.0.1
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    try:
+        # CRITICAL: Change this to 127.0.0.1
+        uvicorn.run(app, host="127.0.0.1", port=8000)
+    finally:
+        # Clean shutdown
+        if agent_process:
+            try:
+                agent_process.terminate()
+                agent_process.wait(timeout=2)
+            except:
+                try:
+                    agent_process.kill()
+                except:
+                    pass

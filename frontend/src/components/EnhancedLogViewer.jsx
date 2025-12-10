@@ -1,9 +1,9 @@
-// EnhancedLogViewer.jsx - Production-Ready Full Search Implementation
+// EnhancedLogViewer.jsx - Clean, Production-Ready Log Viewer with Add Files
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
-    Search, Download, X, Eye, Filter, ChevronLeft, ChevronRight
+    Search, Download, X, Eye, Filter, ChevronLeft, ChevronRight,
+    FileText, Trash2, RefreshCw, FilePlus
 } from 'lucide-react';
-import { FileText } from 'lucide-react';
 
 // Custom hook for debouncing
 const useDebounce = (value, delay) => {
@@ -14,14 +14,219 @@ const useDebounce = (value, delay) => {
             setDebouncedValue(value);
         }, delay);
 
-        return () => {
-            clearTimeout(handler);
-        };
+        return () => clearTimeout(handler);
     }, [value, delay]);
 
     return debouncedValue;
 };
 
+// =============================================================================
+// ADD FILES BUTTON COMPONENT
+// =============================================================================
+const AddFilesButton = ({ sessionId, onFilesAdded }) => {
+    const [showModal, setShowModal] = useState(false);
+    const [isDragging, setIsDragging] = useState(false);
+    const [uploading, setUploading] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState({});
+    const fileInputRef = useRef(null);
+
+    const handleFiles = async (files) => {
+        if (files.length === 0) return;
+
+        setUploading(true);
+
+        try {
+            const formData = new FormData();
+            files.forEach(file => {
+                formData.append('files', file);
+                setUploadProgress(prev => ({ ...prev, [file.name]: 0 }));
+            });
+
+            const progressInterval = setInterval(() => {
+                setUploadProgress(prev => {
+                    const updated = { ...prev };
+                    Object.keys(updated).forEach(key => {
+                        if (updated[key] < 90) updated[key] += 15;
+                    });
+                    return updated;
+                });
+            }, 200);
+
+            const uploadResponse = await fetch(`/api/sessions/${sessionId}/add-files`, {
+                method: 'POST',
+                body: formData
+            });
+
+            clearInterval(progressInterval);
+
+            if (!uploadResponse.ok) {
+                throw new Error(`Upload failed: ${uploadResponse.status}`);
+            }
+
+            setUploadProgress(prev => {
+                const updated = { ...prev };
+                Object.keys(updated).forEach(key => updated[key] = 100);
+                return updated;
+            });
+
+            await new Promise(r => setTimeout(r, 500));
+
+            if (onFilesAdded) {
+                onFilesAdded();
+            }
+
+            setShowModal(false);
+            setUploadProgress({});
+
+        } catch (error) {
+            console.error('Upload error:', error);
+            alert('Failed to upload files: ' + error.message);
+        } finally {
+            setUploading(false);
+        }
+    };
+
+    const handleDrop = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragging(false);
+        handleFiles(Array.from(e.dataTransfer.files));
+    };
+
+    return (
+        <>
+            <button
+                onClick={() => setShowModal(true)}
+                className="p-1.5 rounded-lg smooth-transition"
+                style={{
+                    background: 'var(--bg-tertiary)',
+                    border: '1px solid var(--border-primary)',
+                    color: 'var(--text-secondary)'
+                }}
+                title="Add files to this session"
+            >
+                <FilePlus className="w-3.5 h-3.5" />
+            </button>
+
+            {showModal && (
+                <div
+                    className="fixed inset-0 z-50 flex items-center justify-center"
+                    style={{ background: 'rgba(0, 0, 0, 0.7)' }}
+                    onClick={(e) => {
+                        if (e.target === e.currentTarget && !uploading) {
+                            setShowModal(false);
+                        }
+                    }}
+                >
+                    <div
+                        onDrop={handleDrop}
+                        onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                        onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+                        className="w-full max-w-lg m-4 p-8 rounded-2xl relative"
+                        style={{
+                            background: 'var(--bg-primary)',
+                            border: isDragging ? '3px dashed var(--accent)' : '1px solid var(--border-primary)',
+                            transform: isDragging ? 'scale(1.02)' : 'scale(1)',
+                            transition: 'all 0.2s ease'
+                        }}
+                    >
+                        {!uploading && (
+                            <button
+                                onClick={() => setShowModal(false)}
+                                className="absolute top-4 right-4 p-2 rounded-lg"
+                                style={{ background: 'var(--bg-tertiary)' }}
+                            >
+                                <X className="w-4 h-4" style={{ color: 'var(--text-secondary)' }} />
+                            </button>
+                        )}
+
+                        <input
+                            ref={fileInputRef}
+                            type="file"
+                            multiple
+                            onChange={(e) => handleFiles(Array.from(e.target.files || []))}
+                            className="hidden"
+                            disabled={uploading}
+                        />
+
+                        {uploading ? (
+                            <div className="text-center">
+                                <div
+                                    className="animate-spin w-12 h-12 border-4 border-t-transparent rounded-full mx-auto mb-4"
+                                    style={{ borderColor: 'var(--accent)', borderTopColor: 'transparent' }}
+                                />
+                                <p className="text-lg font-semibold mb-4" style={{ color: 'var(--text-primary)' }}>
+                                    Adding files...
+                                </p>
+                                <div className="space-y-2 max-h-40 overflow-y-auto">
+                                    {Object.entries(uploadProgress).map(([filename, progress]) => (
+                                        <div key={filename}>
+                                            <div className="flex justify-between text-sm mb-1" style={{ color: 'var(--text-secondary)' }}>
+                                                <span className="truncate max-w-[300px]">{filename}</span>
+                                                <span>{progress}%</span>
+                                            </div>
+                                            <div className="h-1.5 rounded-full" style={{ background: 'var(--bg-tertiary)' }}>
+                                                <div
+                                                    className="h-full rounded-full transition-all"
+                                                    style={{
+                                                        width: `${progress}%`,
+                                                        background: progress === 100 ? '#10b981' : 'var(--accent)'
+                                                    }}
+                                                />
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="text-center">
+                                <FilePlus
+                                    className="w-16 h-16 mx-auto mb-4"
+                                    style={{ color: isDragging ? 'var(--accent)' : 'var(--text-tertiary)' }}
+                                />
+
+                                <h3 className="text-xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
+                                    {isDragging ? 'Drop files here' : 'Add Files'}
+                                </h3>
+
+                                <p className="text-sm mb-4" style={{ color: 'var(--text-secondary)' }}>
+                                    Drag & drop or click to browse
+                                </p>
+
+                                <div className="flex flex-wrap justify-center gap-2 text-xs mb-4">
+                                    {['.log', '.json', '.txt', '.tar.gz', '.zip'].map(ext => (
+                                        <span
+                                            key={ext}
+                                            className="px-2 py-1 rounded-full"
+                                            style={{ background: 'var(--bg-tertiary)', color: 'var(--text-secondary)' }}
+                                        >
+                                            {ext}
+                                        </span>
+                                    ))}
+                                </div>
+
+                                <button
+                                    onClick={() => fileInputRef.current?.click()}
+                                    className="px-6 py-2 rounded-xl font-semibold"
+                                    style={{
+                                        background: 'var(--accent)',
+                                        color: 'var(--bg-primary)'
+                                    }}
+                                >
+                                    Browse Files
+                                </button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+        </>
+    );
+};
+
+// =============================================================================
+// MAIN ENHANCED LOG VIEWER COMPONENT
+// =============================================================================
 const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }) => {
     const [selectedFile, setSelectedFile] = useState(initialFile);
     const [fileContent, setFileContent] = useState(null);
@@ -32,62 +237,100 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
 
     // Virtual scrolling state
     const [visibleRange, setVisibleRange] = useState({ start: 0, end: 100 });
-    const [scrollTop, setScrollTop] = useState(0);
     const scrollContainerRef = useRef(null);
-    const rowHeight = 24; // Height of each log line in pixels
-    const overscan = 10; // Render extra rows for smoother scrolling
+    const rowHeight = 24;
+    const overscan = 10;
 
-    // Performance optimizations
+    // Search and filtering
     const debouncedSearchQuery = useDebounce(searchQuery, 300);
-    const [fileMetadata, setFileMetadata] = useState(null);
-
-    // Core state for robust search
     const [rawLines, setRawLines] = useState([]);
     const [availableFields, setAvailableFields] = useState({});
     const [showFieldHelper, setShowFieldHelper] = useState(false);
     const [isJsonFile, setIsJsonFile] = useState(false);
     const [filterStats, setFilterStats] = useState({ total: 0, filtered: 0 });
-    const [searchInProgress, setSearchInProgress] = useState(false);
 
-    // Cache for parsed JSON lines (lazy parsing)
+    // JSON parsing cache
     const jsonCacheRef = useRef(new Map());
 
-    // Filter fileList based on search
-    const fileList = Object.entries(analysisData?.log_files || {}).map(([path, info]) => ({
-        path,
-        name: path.split('/').pop(),
-        ...info
-    })).filter(file => {
-        if (fileSearchTerm) {
-            const searchLower = fileSearchTerm.toLowerCase();
-            return file.path.toLowerCase().includes(searchLower) ||
-                file.name.toLowerCase().includes(searchLower);
-        }
-        return true;
-    });
+    // Refreshable file list
+    const [fileListData, setFileListData] = useState(analysisData?.log_files || {});
+    const [isRefreshing, setIsRefreshing] = useState(false);
 
-    // Load file metadata first
+    const [sidebarWidth, setSidebarWidth] = useState(320);
+    const [isResizing, setIsResizing] = useState(false);
+
+    // Sidebar resize handler
+    const handleMouseMove = useCallback((e) => {
+        if (!isResizing) return;
+        const newWidth = Math.min(Math.max(200, e.clientX), 500);
+        setSidebarWidth(newWidth);
+    }, [isResizing]);
+
+    const handleMouseUp = useCallback(() => {
+        setIsResizing(false);
+    }, []);
+
     useEffect(() => {
-        if (!selectedFile || !sessionId) return;
+        if (isResizing) {
+            document.addEventListener('mousemove', handleMouseMove);
+            document.addEventListener('mouseup', handleMouseUp);
+            return () => {
+                document.removeEventListener('mousemove', handleMouseMove);
+                document.removeEventListener('mouseup', handleMouseUp);
+            };
+        }
+    }, [isResizing, handleMouseMove, handleMouseUp]);
 
-        const loadMetadata = async () => {
+    // Fetch fresh file list when component mounts or session changes
+    useEffect(() => {
+        const fetchFresh = async () => {
             try {
-                const response = await fetch(`/api/logs/${sessionId}/${selectedFile}/metadata`);
-                const data = await response.json();
-                setFileMetadata(data);
-
-                // Better JSON detection
-                const isJson = data.is_json_log ||
-                    selectedFile.includes('json') ||
-                    selectedFile.endsWith('.json');
-                setIsJsonFile(isJson);
-            } catch (err) {
-                console.error('Error loading metadata:', err);
+                const response = await fetch(`/api/analysis/${sessionId}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    setFileListData(data.log_files || {});
+                } else {
+                    setFileListData(analysisData?.log_files || {});
+                }
+            } catch (error) {
+                setFileListData(analysisData?.log_files || {});
             }
         };
 
-        loadMetadata();
-    }, [selectedFile, sessionId]);
+        fetchFresh();
+    }, [sessionId]);
+
+    // Refresh file list from API
+    const refreshFileList = useCallback(async () => {
+        setIsRefreshing(true);
+        try {
+            const response = await fetch(`/api/analysis/${sessionId}`);
+            if (response.ok) {
+                const data = await response.json();
+                setFileListData(data.log_files || {});
+            }
+        } catch (error) {
+            console.error('Error refreshing file list:', error);
+        } finally {
+            setIsRefreshing(false);
+        }
+    }, [sessionId]);
+
+    // Build filtered file list
+    const fileList = useMemo(() => {
+        return Object.entries(fileListData).map(([path, info]) => ({
+            path,
+            name: path.split('/').pop(),
+            ...info
+        })).filter(file => {
+            if (fileSearchTerm) {
+                const searchLower = fileSearchTerm.toLowerCase();
+                return file.path.toLowerCase().includes(searchLower) ||
+                    file.name.toLowerCase().includes(searchLower);
+            }
+            return true;
+        }).sort((a, b) => a.name.localeCompare(b.name));
+    }, [fileListData, fileSearchTerm]);
 
     // Navigation effects
     useEffect(() => {
@@ -106,6 +349,40 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
         }
     }, [initialLine, rawLines]);
 
+    // Delete file handler
+    const handleDeleteFile = useCallback(async (filePath, e) => {
+        e.stopPropagation(); // Don't select the file
+
+        if (!confirm(`Delete "${filePath.split('/').pop()}"?`)) {
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                `/api/sessions/${sessionId}/files/${encodeURIComponent(filePath)}`,
+                { method: 'DELETE' }
+            );
+
+            if (!response.ok) {
+                throw new Error('Failed to delete');
+            }
+
+            // If we deleted the selected file, clear selection
+            if (selectedFile === filePath) {
+                setSelectedFile(null);
+                setFileContent(null);
+                setRawLines([]);
+            }
+
+            // Refresh file list
+            refreshFileList();
+
+        } catch (error) {
+            console.error('Delete error:', error);
+            alert('Failed to delete file');
+        }
+    }, [sessionId, selectedFile, refreshFileList]);
+
     // Load file content
     useEffect(() => {
         if (!selectedFile || !sessionId) return;
@@ -114,17 +391,14 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
             setLoading(true);
             setSearchQuery('');
             setVisibleRange({ start: 0, end: 100 });
-            jsonCacheRef.current.clear(); // Clear JSON cache
+            jsonCacheRef.current.clear();
 
             try {
                 const response = await fetch(`/api/logs/${sessionId}/${selectedFile}`);
                 const data = await response.json();
 
-                // Store raw lines for full search capability
                 setRawLines(data.content || []);
                 setFileContent(data);
-
-                // Analyze fields from a sample for field helper
                 analyzeFieldsFromSample(data.content);
 
             } catch (err) {
@@ -137,7 +411,7 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
         loadFileContent();
     }, [selectedFile, sessionId]);
 
-    // Analyze fields from sample for the field helper UI
+    // Analyze JSON fields from sample
     const analyzeFieldsFromSample = (lines) => {
         if (!lines || lines.length === 0) return;
 
@@ -169,13 +443,10 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                             }
                         }
                     });
-                } catch (e) {
-                    // Not JSON, continue
-                }
+                } catch (e) { }
             }
         }
 
-        // Convert sets to arrays
         Object.keys(fields).forEach(key => {
             fields[key].sampleValues = Array.from(fields[key].sampleValues)
                 .slice(0, 20)
@@ -184,24 +455,21 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
 
         setAvailableFields(fields);
 
-        // Auto-show field helper if we found JSON fields
         const jsonRatio = jsonCount / sampleSize;
         if ((jsonRatio > 0.1 && Object.keys(fields).length > 3) || jsonRatio > 0.3) {
             setShowFieldHelper(true);
-            if (!isJsonFile) {
-                setIsJsonFile(true); // Update local state
-            }
+            setIsJsonFile(true);
+        } else {
+            setIsJsonFile(false);
         }
     };
 
     // Parse JSON on-demand with caching
     const parseJsonLine = useCallback((line, index) => {
-        // Check cache first
         if (jsonCacheRef.current.has(index)) {
             return jsonCacheRef.current.get(index);
         }
 
-        // Parse if looks like JSON
         if (typeof line === 'string' && line.trim().startsWith('{')) {
             try {
                 const parsed = JSON.parse(line);
@@ -221,7 +489,6 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
     const parseSearchQuery = (query) => {
         if (!query.trim()) return null;
 
-        // Handle OR conditions
         if (query.includes(' OR ')) {
             const parts = query.split(' OR ');
             return {
@@ -230,7 +497,6 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
             };
         }
 
-        // Handle AND conditions
         if (query.includes(' AND ')) {
             const parts = query.split(' AND ');
             return {
@@ -239,7 +505,6 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
             };
         }
 
-        // Handle NOT conditions
         if (query.startsWith('NOT ')) {
             return {
                 type: 'NOT',
@@ -247,7 +512,6 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
             };
         }
 
-        // Handle field queries
         if (query.includes(':')) {
             const match = query.match(/^([^:]+):(.+)$/);
             if (match) {
@@ -269,28 +533,22 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
             }
         }
 
-        // Default to text search
         return { type: 'TEXT', value: query };
     };
 
-    // Evaluate query against a line (with on-demand JSON parsing)
+    // Evaluate query against a line
     const evaluateQuery = useCallback((query, line, index) => {
         if (!query) return true;
 
         switch (query.type) {
             case 'OR':
                 return query.conditions.some(c => evaluateQuery(c, line, index));
-
             case 'AND':
                 return query.conditions.every(c => evaluateQuery(c, line, index));
-
             case 'NOT':
                 return !evaluateQuery(query.condition, line, index);
-
             case 'TEXT':
                 return line.toLowerCase().includes(query.value.toLowerCase());
-
-            // Field-based queries with on-demand parsing
             case 'FIELD_EQ':
             case 'FIELD_NEQ':
             case 'FIELD_GT':
@@ -302,7 +560,7 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
 
                 const fieldValue = parsed[query.field];
                 if (fieldValue === undefined || fieldValue === null) {
-                    return query.type === 'FIELD_NEQ'; // undefined != anything is true
+                    return query.type === 'FIELD_NEQ';
                 }
 
                 switch (query.type) {
@@ -321,29 +579,24 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                     default:
                         return false;
                 }
-
             default:
                 return true;
         }
     }, [parseJsonLine]);
 
-    // ROBUST FULL SEARCH - searches ALL lines, not just a sample
+    // Full search
     const filteredIndices = useMemo(() => {
         if (!rawLines.length) return [];
 
         const query = parseSearchQuery(debouncedSearchQuery);
 
-        // No query = show all
         if (!query) {
             const allIndices = rawLines.map((_, index) => index);
             setFilterStats({ total: rawLines.length, filtered: rawLines.length });
             return allIndices;
         }
 
-        setSearchInProgress(true);
         const matchingIndices = [];
-
-        // Search through ALL lines for complete accuracy
         for (let i = 0; i < rawLines.length; i++) {
             if (evaluateQuery(query, rawLines[i], i)) {
                 matchingIndices.push(i);
@@ -351,48 +604,38 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
         }
 
         setFilterStats({ total: rawLines.length, filtered: matchingIndices.length });
-        setSearchInProgress(false);
-
         return matchingIndices;
     }, [rawLines, debouncedSearchQuery, evaluateQuery]);
 
-    // Reset scroll position when filter changes
+    // Reset scroll on filter change
     useEffect(() => {
         if (scrollContainerRef.current) {
             scrollContainerRef.current.scrollTop = 0;
         }
         setVisibleRange({ start: 0, end: 100 });
-        setScrollTop(0);
     }, [filteredIndices]);
 
-    // Virtual scrolling handler
+    // Virtual scrolling
     const handleScroll = useCallback((e) => {
         const scrollTop = e.target.scrollTop;
         const containerHeight = e.target.clientHeight;
 
-        const totalHeight = filteredIndices.length * rowHeight;
-        const maxScrollTop = Math.max(0, totalHeight - containerHeight);
-
-        const clampedScrollTop = Math.min(scrollTop, maxScrollTop);
-
-        const startIndex = Math.floor(clampedScrollTop / rowHeight) - overscan;
-        const endIndex = Math.ceil((clampedScrollTop + containerHeight) / rowHeight) + overscan;
+        const startIndex = Math.floor(scrollTop / rowHeight) - overscan;
+        const endIndex = Math.ceil((scrollTop + containerHeight) / rowHeight) + overscan;
 
         setVisibleRange({
             start: Math.max(0, startIndex),
             end: Math.min(filteredIndices.length, endIndex)
         });
-        setScrollTop(clampedScrollTop);
     }, [filteredIndices.length, rowHeight, overscan]);
 
-    // Get visible lines for rendering
+    // Get visible lines
     const visibleLines = useMemo(() => {
         return filteredIndices
             .slice(visibleRange.start, visibleRange.end)
             .map(index => ({
                 line: rawLines[index],
-                originalIndex: index,
-                filteredIndex: visibleRange.start + filteredIndices.slice(visibleRange.start, visibleRange.end).indexOf(index)
+                originalIndex: index
             }));
     }, [filteredIndices, visibleRange, rawLines]);
 
@@ -409,7 +652,6 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
 
     const insertFieldFilter = (field, value, operator = '') => {
         const filterText = operator ? `${field}:${operator}${value}` : `${field}:${value}`;
-
         if (searchQuery) {
             setSearchQuery(`${searchQuery} AND ${filterText}`);
         } else {
@@ -419,82 +661,82 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
 
     const getExampleQueries = () => {
         const examples = [];
-
         if (availableFields.severity || availableFields.level) {
-            examples.push('severity:error OR severity:fatal');
+            examples.push('severity:error');
         }
         if (availableFields.status) {
             examples.push('status:>=500');
-            examples.push('status:404 OR status:403');
         }
         if (availableFields.method) {
-            examples.push('method:POST AND status:>=400');
+            examples.push('method:POST');
         }
-        if (availableFields.duration_s || availableFields.duration || availableFields.response_time) {
+        if (availableFields.duration_s) {
             examples.push('duration_s:>1');
         }
-        if (availableFields.correlation_id) {
-            examples.push('correlation_id:YOUR_ID_HERE');
-        }
-        examples.push('NOT level:debug');
-        examples.push('error AND NOT "connection reset"');
-
-        return examples.slice(0, 5);
-    };
-
-    // Jump to line function
-    const jumpToLine = (lineNumber) => {
-        const targetIndex = lineNumber - 1;
-        const filteredPosition = filteredIndices.indexOf(targetIndex);
-
-        if (filteredPosition !== -1) {
-            const newScrollTop = filteredPosition * rowHeight;
-            if (scrollContainerRef.current) {
-                scrollContainerRef.current.scrollTop = newScrollTop;
-            }
-            setCurrentLine(lineNumber);
-        }
+        examples.push('error');
+        examples.push('NOT debug');
+        return examples.slice(0, 4);
     };
 
     return (
         <div className="h-full flex" style={{ background: 'var(--bg-primary)' }}>
-            {/* Left sidebar */}
-            <div className="w-80 flex flex-col" style={{
+            {/* Left sidebar - File list */}
+            <div className="flex flex-col" style={{
+                width: `${sidebarWidth}px`,
                 background: 'var(--bg-secondary)',
                 borderRight: '1px solid var(--border-primary)'
             }}>
-                <div className="p-4" style={{ borderBottom: '1px solid var(--border-primary)' }}>
-                    <h3 className="font-bold" style={{ color: 'var(--text-primary)' }}>Log Files</h3>
-                    <p className="text-sm mt-1" style={{ color: 'var(--text-secondary)' }}>
-                        {fileList.length} {fileSearchTerm ? `of ${Object.keys(analysisData?.log_files || {}).length}` : ''} files found
-                    </p>
-
-                    <div className="mt-3">
-                        <div className="relative">
-                            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4"
-                                style={{ color: 'var(--text-tertiary)' }} />
-                            <input
-                                type="text"
-                                placeholder="Search files..."
-                                value={fileSearchTerm}
-                                onChange={(e) => setFileSearchTerm(e.target.value)}
-                                className="w-full pl-10 pr-8 py-2 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-current"
-                                style={{
-                                    background: 'var(--bg-primary)',
-                                    border: '1px solid var(--border-primary)',
-                                    color: 'var(--text-primary)'
-                                }}
+                <div className="p-3" style={{ borderBottom: '1px solid var(--border-primary)' }}>
+                    <div className="flex items-center justify-between mb-2">
+                        <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+                            Files ({fileList.length})
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                            <AddFilesButton
+                                sessionId={sessionId}
+                                onFilesAdded={refreshFileList}
                             />
-                            {fileSearchTerm && (
-                                <button
-                                    onClick={() => setFileSearchTerm('')}
-                                    className="absolute right-2 top-1/2 transform -translate-y-1/2 p-1 rounded hover:bg-gray-600/20"
-                                    title="Clear search"
-                                >
-                                    <X className="w-3 h-3" style={{ color: 'var(--text-tertiary)' }} />
-                                </button>
-                            )}
+                            <button
+                                onClick={refreshFileList}
+                                disabled={isRefreshing}
+                                className="p-1.5 rounded-lg smooth-transition disabled:opacity-50"
+                                style={{
+                                    background: 'var(--bg-tertiary)',
+                                    border: '1px solid var(--border-primary)'
+                                }}
+                                title="Refresh"
+                            >
+                                <RefreshCw
+                                    className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`}
+                                    style={{ color: 'var(--text-secondary)' }}
+                                />
+                            </button>
                         </div>
+                    </div>
+
+                    <div className="relative">
+                        <Search className="absolute left-2.5 top-1/2 transform -translate-y-1/2 w-3.5 h-3.5"
+                            style={{ color: 'var(--text-tertiary)' }} />
+                        <input
+                            type="text"
+                            placeholder="Filter files..."
+                            value={fileSearchTerm}
+                            onChange={(e) => setFileSearchTerm(e.target.value)}
+                            className="w-full pl-8 pr-7 py-1.5 rounded-lg text-sm focus:outline-none"
+                            style={{
+                                background: 'var(--bg-primary)',
+                                border: '1px solid var(--border-primary)',
+                                color: 'var(--text-primary)'
+                            }}
+                        />
+                        {fileSearchTerm && (
+                            <button
+                                onClick={() => setFileSearchTerm('')}
+                                className="absolute right-2 top-1/2 transform -translate-y-1/2"
+                            >
+                                <X className="w-3 h-3" style={{ color: 'var(--text-tertiary)' }} />
+                            </button>
+                        )}
                     </div>
                 </div>
 
@@ -503,12 +745,10 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                         fileList.map((file) => (
                             <div
                                 key={file.path}
-                                className={`px-4 py-3 cursor-pointer text-sm flex items-center smooth-transition ${selectedFile === file.path ? 'btn-primary' : ''
-                                    }`}
+                                className={`group px-3 py-1 cursor-pointer text-sm flex items-center smooth-transition ${selectedFile === file.path ? 'btn-primary rounded-full' : ''}`}
                                 style={{
                                     background: selectedFile === file.path ? 'var(--accent)' : 'transparent',
                                     color: selectedFile === file.path ? 'var(--bg-primary)' : 'var(--text-primary)',
-                                    ':hover': { background: 'var(--hover-bg)' }
                                 }}
                                 onClick={() => {
                                     setSelectedFile(file.path);
@@ -516,322 +756,248 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                                 }}
                                 onMouseEnter={(e) => selectedFile !== file.path && (e.currentTarget.style.background = 'var(--hover-bg)')}
                                 onMouseLeave={(e) => selectedFile !== file.path && (e.currentTarget.style.background = 'transparent')}
+                                title={file.path}
                             >
                                 <FileText className="w-4 h-4 mr-3 flex-shrink-0" />
-                                <div className="flex-1 min-w-0">
-                                    <div className="truncate font-medium">{file.name}</div>
-                                    <div className="text-xs opacity-70 mt-1">
-                                        {file.lines?.toLocaleString()} lines • {file.service}
-                                        {file.is_json_log && (
-                                            <span className="ml-2 text-green-500" title="JSON formatted logs">JSON</span>
-                                        )}
-                                        {file.size > 10 * 1024 * 1024 && (
-                                            <span className="ml-2 text-blue-500" title="Large file - optimized loading">⚡</span>
-                                        )}
-                                    </div>
-                                </div>
+                                <span className="flex-1 truncate">{file.name}</span>
+                                <button
+                                    onClick={(e) => handleDeleteFile(file.path, e)}
+                                    className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-red-500/20 transition-opacity"
+                                    title="Remove file"
+                                >
+                                    <Trash2 className="w-3.5 h-3.5 text-red-400" />
+                                </button>
                             </div>
                         ))
                     ) : (
                         <div className="p-4 text-center" style={{ color: 'var(--text-tertiary)' }}>
                             <p className="text-sm">
-                                {fileSearchTerm ? `No files match "${fileSearchTerm}"` : 'No files found'}
+                                {fileSearchTerm ? 'No matches' : 'No files'}
                             </p>
                         </div>
                     )}
                 </div>
             </div>
 
+            {/* Resize handle */}
+            <div
+                className="w-1 cursor-col-resize hover:bg-blue-500 active:bg-blue-500 transition-colors"
+                style={{ background: isResizing ? 'var(--accent)' : 'transparent' }}
+                onMouseDown={() => setIsResizing(true)}
+            />
+
             {/* Main content area */}
             <div className="flex-1 flex flex-col">
                 {selectedFile ? (
                     <>
                         {/* Header */}
-                        <div className="p-4" style={{
+                        <div className="p-3" style={{
                             background: 'var(--bg-secondary)',
                             borderBottom: '1px solid var(--border-primary)'
                         }}>
-                            <div className="flex items-center justify-between mb-3">
-                                <div>
-                                    <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
+                            <div className="flex items-center justify-between mb-2">
+                                <div className="min-w-0 flex-1">
+                                    <h2 className="font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
                                         {selectedFile.split('/').pop()}
                                     </h2>
-                                    <p className="text-xs mt-1" style={{ color: 'var(--text-secondary)' }}>{selectedFile}</p>
                                 </div>
-                                <div className="flex items-center gap-4">
-                                    <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                                <div className="flex items-center gap-3 ml-4">
+                                    <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>
                                         {filterStats.filtered !== filterStats.total && (
                                             <span style={{ color: '#f59e0b' }}>
-                                                {filterStats.filtered.toLocaleString()} filtered /
+                                                {filterStats.filtered.toLocaleString()} /
                                             </span>
                                         )}
-                                        {' '}{filterStats.total.toLocaleString()} total
-                                        {searchInProgress && (
-                                            <span className="ml-2" style={{ color: '#f59e0b' }} title="Search in progress">
-                                                ⏳
-                                            </span>
-                                        )}
+                                        {' '}{filterStats.total.toLocaleString()} lines
                                     </span>
                                     <button
                                         onClick={() => {
-                                            const url = `/api/logs/${sessionId}/${selectedFile}/download`;
-                                            window.open(url, '_blank');
+                                            window.open(`/api/logs/${sessionId}/${selectedFile}/download`, '_blank');
                                         }}
-                                        className="p-2 rounded-xl smooth-transition"
-                                        style={{
-                                            color: 'var(--text-secondary)',
-                                            ':hover': { background: 'var(--hover-bg)' }
-                                        }}
-                                        title="Download full file"
+                                        className="p-1.5 rounded-lg smooth-transition"
+                                        style={{ color: 'var(--text-secondary)' }}
+                                        title="Download"
                                     >
-                                        <Download className="w-5 h-5" />
+                                        <Download className="w-4 h-4" />
                                     </button>
                                 </div>
                             </div>
 
-                            {/* Search bar */}
-                            <div className="space-y-2">
-                                <div className="flex gap-2">
-                                    <div className="flex-1 relative">
-                                        <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5"
-                                            style={{ color: 'var(--text-tertiary)' }} />
-                                        <input
-                                            type="text"
-                                            placeholder={isJsonFile
-                                                ? "Search with boolean: field:value AND/OR/NOT (e.g., status:>=500 AND method:POST)"
-                                                : "Search in file..."}
-                                            value={searchQuery}
-                                            onChange={(e) => setSearchQuery(e.target.value)}
-                                            className="w-full pl-10 pr-4 py-2 rounded-xl focus:outline-none focus:ring-2 focus:ring-current smooth-transition text-sm"
-                                            style={{
-                                                background: 'var(--bg-primary)',
-                                                border: '1px solid var(--border-primary)',
-                                                color: 'var(--text-primary)',
-                                                fontFamily: 'monospace'
-                                            }}
-                                        />
-                                        {searchQuery !== debouncedSearchQuery && (
-                                            <span className="absolute right-10 top-1/2 transform -translate-y-1/2 text-xs"
-                                                style={{ color: '#f59e0b' }}>
-                                                ⏳
-                                            </span>
-                                        )}
-                                    </div>
-                                    {searchQuery && (
-                                        <button
-                                            onClick={() => setSearchQuery('')}
-                                            className="px-3 py-2 rounded-xl smooth-transition btn-secondary"
-                                        >
-                                            Clear
-                                        </button>
-                                    )}
-                                    {(isJsonFile || Object.keys(availableFields).length > 0) && (
-                                        <button
-                                            onClick={() => setShowFieldHelper(!showFieldHelper)}
-                                            className="px-3 py-2 rounded-xl smooth-transition btn-secondary flex items-center gap-2"
-                                        >
-                                            <Filter className="w-4 h-4" />
-                                            Fields
-                                        </button>
-                                    )}
+                            {/* Search */}
+                            <div className="flex gap-2">
+                                <div className="flex-1 relative">
+                                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4"
+                                        style={{ color: 'var(--text-tertiary)' }} />
+                                    <input
+                                        type="text"
+                                        placeholder={isJsonFile ? "field:value AND/OR/NOT" : "Search..."}
+                                        value={searchQuery}
+                                        onChange={(e) => setSearchQuery(e.target.value)}
+                                        className="w-full pl-9 pr-3 py-1.5 rounded-lg text-sm focus:outline-none"
+                                        style={{
+                                            background: 'var(--bg-primary)',
+                                            border: '1px solid var(--border-primary)',
+                                            color: 'var(--text-primary)',
+                                            fontFamily: 'monospace'
+                                        }}
+                                    />
                                 </div>
-
-                                {/* Example queries */}
-                                {(isJsonFile || Object.keys(availableFields).length > 0) && !searchQuery && (
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                        <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>Try:</span>
-                                        {getExampleQueries().map((example, idx) => (
-                                            <button
-                                                key={idx}
-                                                onClick={() => setSearchQuery(example)}
-                                                className="text-xs px-2 py-1 rounded-lg smooth-transition"
-                                                style={{
-                                                    background: 'var(--bg-tertiary)',
-                                                    color: 'var(--text-secondary)',
-                                                    border: '1px solid var(--border-primary)',
-                                                    fontFamily: 'monospace'
-                                                }}
-                                            >
-                                                {example}
-                                            </button>
-                                        ))}
-                                    </div>
+                                {searchQuery && (
+                                    <button
+                                        onClick={() => setSearchQuery('')}
+                                        className="px-3 py-1.5 rounded-lg text-sm"
+                                        style={{
+                                            background: 'var(--bg-tertiary)',
+                                            color: 'var(--text-secondary)'
+                                        }}
+                                    >
+                                        Clear
+                                    </button>
+                                )}
+                                {Object.keys(availableFields).length > 0 && (
+                                    <button
+                                        onClick={() => setShowFieldHelper(!showFieldHelper)}
+                                        className="px-3 py-1.5 rounded-lg text-sm flex items-center gap-1.5"
+                                        style={{
+                                            background: showFieldHelper ? 'var(--accent)' : 'var(--bg-tertiary)',
+                                            color: showFieldHelper ? 'var(--bg-primary)' : 'var(--text-secondary)'
+                                        }}
+                                    >
+                                        <Filter className="w-3.5 h-3.5" />
+                                        Fields
+                                    </button>
                                 )}
                             </div>
 
-                            {/* Field helper panel */}
+                            {/* Quick filters */}
+                            {!searchQuery && isJsonFile && (
+                                <div className="flex items-center gap-2 mt-2 flex-wrap">
+                                    <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>Try:</span>
+                                    {getExampleQueries().map((q, i) => (
+                                        <button
+                                            key={i}
+                                            onClick={() => setSearchQuery(q)}
+                                            className="text-xs px-2 py-0.5 rounded"
+                                            style={{
+                                                background: 'var(--bg-tertiary)',
+                                                color: 'var(--text-secondary)',
+                                                fontFamily: 'monospace'
+                                            }}
+                                        >
+                                            {q}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+
+                            {/* Field helper */}
                             {showFieldHelper && Object.keys(availableFields).length > 0 && (
-                                <div className="mt-3 p-3 rounded-lg overflow-y-auto" style={{
+                                <div className="mt-2 p-2 rounded-lg text-xs overflow-y-auto" style={{
                                     background: 'var(--bg-tertiary)',
-                                    border: '1px solid var(--border-primary)',
-                                    maxHeight: '200px'
+                                    maxHeight: '150px'
                                 }}>
-                                    <div className="text-xs font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>
-                                        Available Fields (click to filter):
-                                    </div>
-                                    <div className="grid grid-cols-2 gap-2 text-xs">
+                                    <div className="grid grid-cols-3 gap-2">
                                         {Object.entries(availableFields)
                                             .sort((a, b) => b[1].count - a[1].count)
-                                            .slice(0, 20) // Show top 20 fields
+                                            .slice(0, 15)
                                             .map(([field, info]) => (
-                                                <div key={field} className="space-y-1">
-                                                    <div className="font-medium" style={{ color: 'var(--text-secondary)' }}>
+                                                <div key={field}>
+                                                    <div className="font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
                                                         {field}
-                                                        <span style={{ color: 'var(--text-tertiary)' }}> ({info.type})</span>
                                                     </div>
                                                     <div className="flex flex-wrap gap-1">
-                                                        {info.sampleValues.slice(0, 3).map((value, idx) => (
+                                                        {info.sampleValues.slice(0, 2).map((value, idx) => (
                                                             <button
                                                                 key={idx}
                                                                 onClick={() => insertFieldFilter(field, value)}
-                                                                className="px-1.5 py-0.5 rounded text-xs smooth-transition truncate max-w-[150px]"
+                                                                className="px-1 py-0.5 rounded truncate max-w-[80px]"
                                                                 style={{
                                                                     background: 'var(--bg-primary)',
                                                                     color: 'var(--text-primary)',
-                                                                    border: '1px solid var(--border-primary)',
                                                                     fontFamily: 'monospace'
                                                                 }}
-                                                                title={`Filter: ${field}:${value}`}
                                                             >
                                                                 {value}
                                                             </button>
                                                         ))}
-                                                        {info.type === 'number' && (
-                                                            <>
-                                                                <button
-                                                                    onClick={() => insertFieldFilter(field, '0', '>')}
-                                                                    className="px-1.5 py-0.5 rounded text-xs smooth-transition"
-                                                                    style={{
-                                                                        background: 'var(--bg-primary)',
-                                                                        color: 'var(--text-tertiary)',
-                                                                        border: '1px solid var(--border-primary)',
-                                                                        fontFamily: 'monospace'
-                                                                    }}
-                                                                    title={`Filter: ${field}:>0`}
-                                                                >
-                                                                    {'>'}0
-                                                                </button>
-                                                                <button
-                                                                    onClick={() => insertFieldFilter(field, '100', '<')}
-                                                                    className="px-1.5 py-0.5 rounded text-xs smooth-transition"
-                                                                    style={{
-                                                                        background: 'var(--bg-primary)',
-                                                                        color: 'var(--text-tertiary)',
-                                                                        border: '1px solid var(--border-primary)',
-                                                                        fontFamily: 'monospace'
-                                                                    }}
-                                                                    title={`Filter: ${field}:<100`}
-                                                                >
-                                                                    {'<'}100
-                                                                </button>
-                                                            </>
-                                                        )}
                                                     </div>
                                                 </div>
                                             ))}
-                                    </div>
-                                    <div className="mt-2 pt-2" style={{ borderTop: '1px solid var(--border-primary)' }}>
-                                        <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-                                            💡 Combine with: AND, OR, NOT • Operators: : = != {'>'} {'>='} {'<'} {'<='}
-                                        </div>
                                     </div>
                                 </div>
                             )}
                         </div>
 
-                        {/* Virtual scrolling log viewer */}
-                        <div className="flex-1 overflow-hidden font-mono text-sm" style={{ background: 'var(--bg-primary)' }}>
+                        {/* Log viewer */}
+                        <div className="flex-1 overflow-hidden font-mono text-xs" style={{ background: 'var(--bg-primary)' }}>
                             {loading ? (
                                 <div className="flex items-center justify-center h-full">
-                                    <div className="animate-spin w-8 h-8 border-3 border-current border-t-transparent rounded-full"
+                                    <div className="animate-spin w-6 h-6 border-2 border-current border-t-transparent rounded-full"
                                         style={{ borderColor: 'var(--text-tertiary)' }} />
                                 </div>
+                            ) : filteredIndices.length === 0 && searchQuery ? (
+                                <div className="flex flex-col items-center justify-center h-full" style={{ color: 'var(--text-tertiary)' }}>
+                                    <Search className="w-10 h-10 mb-3 opacity-50" />
+                                    <p>No matches for "{searchQuery}"</p>
+                                    <button
+                                        onClick={() => setSearchQuery('')}
+                                        className="mt-3 px-4 py-1.5 text-sm rounded-lg"
+                                        style={{ background: 'var(--bg-tertiary)', color: 'var(--text-secondary)' }}
+                                    >
+                                        Clear
+                                    </button>
+                                </div>
                             ) : (
-                                <div className="h-full relative">
-                                    {filteredIndices.length === 0 && searchQuery && (
-                                        <div className="text-center py-8" style={{ color: 'var(--text-tertiary)' }}>
-                                            <Search className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                                            <p>No matches found for:</p>
-                                            <p className="mt-2 font-mono text-sm" style={{ color: 'var(--text-secondary)' }}>
-                                                {searchQuery}
-                                            </p>
-                                            <p className="mt-4 text-xs">
-                                                Searched {rawLines.length.toLocaleString()} lines
-                                            </p>
-                                            <button
-                                                onClick={() => setSearchQuery('')}
-                                                className="mt-4 px-4 py-2 text-sm rounded-lg smooth-transition btn-secondary"
-                                            >
-                                                Clear Search
-                                            </button>
-                                        </div>
-                                    )}
+                                <div
+                                    ref={scrollContainerRef}
+                                    className="h-full overflow-y-auto"
+                                    onScroll={handleScroll}
+                                >
+                                    <div style={{
+                                        height: `${filteredIndices.length * rowHeight}px`,
+                                        position: 'relative'
+                                    }}>
+                                        <div style={{
+                                            transform: `translateY(${visibleRange.start * rowHeight}px)`,
+                                            position: 'absolute',
+                                            top: 0,
+                                            left: 0,
+                                            right: 0
+                                        }}>
+                                            {visibleLines.map((item, idx) => {
+                                                const lineNum = item.originalIndex + 1;
+                                                const level = getLogLevel(item.line);
+                                                const color = level === 'error' ? '#ef4444' :
+                                                    level === 'warning' ? '#f59e0b' :
+                                                        level === 'info' ? '#3b82f6' :
+                                                            level === 'debug' ? '#6b7280' : 'var(--text-primary)';
 
-                                    {filteredIndices.length > 0 && (
-                                        <div
-                                            ref={scrollContainerRef}
-                                            className="h-full overflow-y-auto"
-                                            onScroll={handleScroll}
-                                            style={{ position: 'relative' }}
-                                        >
-                                            {/* Virtual scroll container */}
-                                            <div style={{
-                                                height: `${filteredIndices.length * rowHeight}px`,
-                                                position: 'relative'
-                                            }}>
-                                                {/* Only render visible lines */}
-                                                <div style={{
-                                                    transform: `translateY(${visibleRange.start * rowHeight}px)`,
-                                                    position: 'absolute',
-                                                    top: 0,
-                                                    left: 0,
-                                                    right: 0
-                                                }}>
-                                                    {visibleLines.map((item, idx) => {
-                                                        const actualLineNumber = item.originalIndex + 1;
-                                                        const level = getLogLevel(item.line);
-                                                        const color = level === 'error' ? '#ef4444' :
-                                                            level === 'warning' ? '#f59e0b' :
-                                                                level === 'info' ? '#3b82f6' :
-                                                                    level === 'debug' ? '#6b7280' : 'var(--text-primary)';
-
-                                                        return (
-                                                            <div
-                                                                key={`${actualLineNumber}-${idx}`}
-                                                                className="flex hover:bg-gray-800/20"
-                                                                style={{
-                                                                    minHeight: `${rowHeight}px`,
-                                                                    lineHeight: `${rowHeight}px`
-                                                                }}
-                                                                onMouseEnter={() => setCurrentLine(actualLineNumber)}
-                                                            >
-                                                                <span
-                                                                    className="w-20 flex-shrink-0 select-none text-right pr-4"
-                                                                    style={{
-                                                                        color: 'var(--text-tertiary)',
-                                                                        borderRight: '1px solid var(--border-primary)'
-                                                                    }}
-                                                                    title={`Line ${actualLineNumber}`}
-                                                                >
-                                                                    {actualLineNumber}
-                                                                </span>
-                                                                <pre
-                                                                    className="flex-1 px-4 whitespace-pre-wrap break-all"
-                                                                    style={{
-                                                                        color,
-                                                                        overflowWrap: 'anywhere',
-                                                                        fontSize: '0.75rem'
-                                                                    }}
-                                                                >
-                                                                    {item.line}
-                                                                </pre>
-                                                            </div>
-                                                        );
-                                                    })}
-                                                </div>
-                                            </div>
+                                                return (
+                                                    <div
+                                                        key={`${lineNum}-${idx}`}
+                                                        className="flex hover:bg-gray-500/10 py-1"
+                                                        style={{ minHeight: `${rowHeight}px` }}
+                                                    >
+                                                        <span
+                                                            className="w-16 flex-shrink-0 select-none text-right pr-3 pt-0.5"
+                                                            style={{
+                                                                color: 'var(--text-tertiary)',
+                                                                borderRight: '1px solid var(--border-primary)'
+                                                            }}
+                                                        >
+                                                            {lineNum}
+                                                        </span>
+                                                        <pre
+                                                            className="flex-1 px-3 whitespace-pre-wrap break-all"
+                                                            style={{ color, overflowWrap: 'anywhere', fontSize: '0.75rem' }}
+                                                        >
+                                                            {item.line}
+                                                        </pre>
+                                                    </div>
+                                                );
+                                            })}
                                         </div>
-                                    )}
+                                    </div>
                                 </div>
                             )}
                         </div>
@@ -839,8 +1005,8 @@ const EnhancedLogViewer = ({ sessionId, analysisData, initialFile, initialLine }
                 ) : (
                     <div className="flex-1 flex items-center justify-center" style={{ color: 'var(--text-tertiary)' }}>
                         <div className="text-center">
-                            <FileText className="w-16 h-16 mx-auto mb-4 opacity-50" />
-                            <p className="text-lg">Select a log file to view its contents</p>
+                            <FileText className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                            <p>Select a file to view</p>
                         </div>
                     </div>
                 )}

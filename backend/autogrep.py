@@ -559,11 +559,20 @@ class FalsePositiveFilter:
 class TurboStreamProcessor:
     """Ultra-fast streaming processor with Aho-Corasick pre-filtering"""
     
+    # CONSTANTS - No more magic numbers!
+    MMAP_THRESHOLD_BYTES = 50 * 1024 * 1024  # 50MB
+    MMAP_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB
+    MAX_LINES_IN_MEMORY = 1_000_000  # Safety limit for readlines()
+    CONTEXT_LINES_BEFORE = 10
+    CONTEXT_LINES_AFTER = 10
+    MAX_BOUNDARY_SEARCH_BACK = 100
+    MAX_BOUNDARY_SEARCH_FORWARD = 200
+    
     def __init__(self, pattern_bank: 'EnhancedPatternBank', false_positive_filter: FalsePositiveFilter = None):
         self.pattern_bank = pattern_bank
         self.false_positive_filter = false_positive_filter or FalsePositiveFilter()
         self.boundary_detector = LogBoundaryDetector()
-        self.correlation_tracker = CorrelationTracker()
+        # REMOVED: self.correlation_tracker - will create per-file instead
         self.automaton = pattern_bank.automaton if HAS_AHOCORASICK else None
         self.quick_filters = self._build_quick_filters()
     
@@ -596,7 +605,7 @@ class TurboStreamProcessor:
         try:
             # Check file size for strategy selection
             file_size = file_path.stat().st_size
-            use_mmap = file_size > 50 * 1024 * 1024 and not str(file_path).endswith('.gz')
+            use_mmap = file_size > self.MMAP_THRESHOLD_BYTES and not str(file_path).endswith('.gz')
             
             if use_mmap:
                 errors_found = await self._process_mmap(file_path, result_queue)
@@ -612,27 +621,39 @@ class TurboStreamProcessor:
         """Regular file processing with streaming and context preservation"""
         errors_found = 0
         
+        # CRITICAL FIX: Create correlation tracker per-file (no pollution!)
+        correlation_tracker = CorrelationTracker()
+        
         # Get relevant patterns for this file type
         relevant_patterns = self._get_relevant_patterns(file_path)
         
-        # Load file into memory for context extraction
+        # CRITICAL FIX: Stream large files instead of loading all into memory
         try:
             if str(file_path).endswith('.gz'):
-                with gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                    lines = f.readlines()
+                file_handle = gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore')
             else:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    lines = f.readlines()
+                file_handle = open(file_path, 'r', encoding='utf-8', errors='ignore')
+            
+            # Read file into lines list (with safety limit)
+            lines = []
+            for idx, line in enumerate(file_handle):
+                lines.append(line)
+                if idx >= self.MAX_LINES_IN_MEMORY:
+                    print(f"⚠️  File {file_path.name} exceeds {self.MAX_LINES_IN_MEMORY} lines, truncating for safety")
+                    break
+            
+            file_handle.close()
+            
         except Exception as e:
             print(f"Failed to read {file_path}: {e}")
             return 0
         
         # First pass: Build correlation index
         for idx, line in enumerate(lines):
-            self.correlation_tracker.extract_ids(line, idx, str(file_path))
+            correlation_tracker.extract_ids(line, idx, str(file_path))
         
         # Second pass: Process errors with context
-        line_buffer = deque(maxlen=10)  # Keep last 10 lines for context
+        line_buffer = deque(maxlen=self.CONTEXT_LINES_BEFORE)
         processed_lines = set()  # Track processed lines to avoid duplicates
         
         for line_number, line in enumerate(lines):
@@ -696,7 +717,7 @@ class TurboStreamProcessor:
                         
                         # Get correlation info
                         if error_match.correlation_id:
-                            related = self.correlation_tracker.get_related_entries(error_match.correlation_id)
+                            related = correlation_tracker.get_related_entries(error_match.correlation_id)
                             error_match.json_fields['related_entries_count'] = len(related)
                         
                         # Send to result queue
@@ -725,14 +746,18 @@ class TurboStreamProcessor:
     async def _process_mmap(self, file_path: Path, result_queue: AsyncQueue) -> int:
         """Memory-mapped file processing for huge files"""
         errors_found = 0
+        
+        # CRITICAL FIX: Create correlation tracker per-file
+        correlation_tracker = CorrelationTracker()
+        
         relevant_patterns = self._get_relevant_patterns(file_path)
         
         with open(file_path, 'r+b') as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
                 # Process in chunks
-                chunk_size = 10 * 1024 * 1024  # 10MB chunks
+                chunk_size = self.MMAP_CHUNK_SIZE
                 offset = 0
-                line_buffer = deque(maxlen=10)
+                line_buffer = deque(maxlen=self.CONTEXT_LINES_BEFORE)
                 
                 while offset < len(mmapped_file):
                     # Read chunk
@@ -806,7 +831,7 @@ class TurboStreamProcessor:
                 for end_index, pattern in self.automaton.iter(line_lower):
                     return True
                 return False
-            except:
+            except Exception:  # FIXED: Don't catch KeyboardInterrupt!
                 pass
         
         # Fallback to quick string checks
@@ -990,6 +1015,18 @@ class TurboStreamProcessor:
             'production': ['Rails'],
             'api_json': ['Rails'],
             'application': ['Rails'],
+            # Docker/Container runtime
+            'docker': ['Docker/Containerd'],
+            'containerd': ['Docker/Containerd'],
+            'container': ['Docker/Containerd', 'Kubernetes/Helm'],
+            'cri-o': ['Docker/Containerd'],
+            # Kubernetes
+            'kube': ['Kubernetes/Helm'],
+            'k8s': ['Kubernetes/Helm'],
+            'helm': ['Kubernetes/Helm'],
+            'ingress': ['Kubernetes/Helm'],
+            'pod': ['Kubernetes/Helm'],
+            'deployment': ['Kubernetes/Helm'],
         }
         
         # Determine relevant components
@@ -998,8 +1035,8 @@ class TurboStreamProcessor:
             if key in path_str or key in filename:
                 relevant_components.update(components)
         
-        # Add generic components
-        relevant_components.update(['System/OS', 'Network', 'Generic'])
+        # Add generic components (always checked)
+        relevant_components.update(['System/OS', 'Network', 'Generic', 'SSL/Certificates'])
         
         # Filter patterns by relevance
         relevant = []
@@ -1809,11 +1846,201 @@ class EnhancedPatternBank:
             ErrorPattern('uncaught_exception', r'uncaught\s+exception', 'Generic', 'generic', 'ERROR', multiline=True),
         ]
         
+        # ==================== ADDITIONAL PATTERNS (Docker, K8s extensions, SSL) ====================
+        additional_patterns = [
+            # Docker/Containerd Runtime Errors
+            ErrorPattern('containerd_content_error', r'containerd.*content.*(?:error|not\s+found)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('containerd_cri_error', r'containerd.*CRI.*(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('containerd_gc_error', r'containerd.*(?:garbage\s+collection|gc)\s+(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('containerd_lease_error', r'containerd.*lease.*(?:error|expired)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('containerd_namespace_error', r'containerd.*namespace.*(?:error|not\s+found)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('containerd_oom_killed', r'containerd.*(?:killed|OOM)', 'Docker/Containerd', 'runtime', 'CRITICAL'),
+            ErrorPattern('containerd_runc_error', r'containerd.*runc.*(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('containerd_shim_error', r'containerd.*shim.*(?:error|failed|died)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('containerd_snapshot_error', r'containerd.*snapshot.*(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('crio_container_error', r'cri-o.*container.*(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('crio_image_pull_error', r'cri-o.*(?:pull|image)\s+(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('crio_runtime_error', r'cri-o.*(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_auth_failed', r'(?:docker|containerd).*(?:(?:auth|login)\s+(?:failed|error|denied)|unauthorized|authentication\s+required)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_build_failed', r'docker.*build.*(?:failed|error)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_container_died', r'(?:docker|containerd).*container.*(?:died|exited\s+with\s+error)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_container_start_failed', r'(?:docker|containerd).*failed\s+to\s+start\s+container', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_daemon_error', r'docker.*(?:daemon|dockerd)\s+(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_healthcheck_failed', r'(?:docker|containerd).*healthcheck.*(?:failed|unhealthy)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_image_not_found', r'(?:docker|containerd).*(?:image|repository)\s+not\s+found', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_layer_error', r'docker.*layer.*(?:error|failed|invalid)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_manifest_error', r'docker.*manifest.*(?:error|not\s+found|invalid)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_network_error', r'docker.*network.*(?:error|failed)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_no_space', r'(?:docker|containerd).*no\s+space\s+left', 'Docker/Containerd', 'runtime', 'CRITICAL'),
+            ErrorPattern('docker_oci_create_failed', r'(?:docker|containerd).*(?:OCI|runc).*(?:create|start)\s+failed', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_oci_exec_failed', r'(?:docker|containerd).*(?:OCI|runc).*exec\s+failed', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_oci_runtime_error', r'(?:docker|containerd).*(?:OCI|runc)\s+runtime\s+error', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_permission_denied', r'(?:docker|containerd).*permission\s+denied', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_pull_failed', r'(?:docker|containerd).*(?:pull|fetch)\s+(?:failed|error)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_push_failed', r'docker.*push.*(?:failed|error)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_registry_error', r'(?:docker|containerd).*registry.*(?:error|unavailable|timeout)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            ErrorPattern('docker_volume_error', r'(?:docker|containerd).*volume.*(?:error|failed|not\s+found)', 'Docker/Containerd', 'runtime', 'ERROR'),
+            
+            # Additional SSL/Certificate patterns
+            ErrorPattern('ssl_cert_verify_failed', r'certificate\s+verify\s+failed', 'SSL/Certificates', 'security', 'ERROR'),
+            ErrorPattern('ssl_cert_expired', r'certificate\s+has\s+expired', 'SSL/Certificates', 'security', 'ERROR'),
+            ErrorPattern('ssl_cert_not_yet_valid', r'certificate\s+is\s+not\s+yet\s+valid', 'SSL/Certificates', 'security', 'ERROR'),
+            ErrorPattern('ssl_hostname_mismatch', r'hostname.*(?:mismatch|does\s+not\s+match)', 'SSL/Certificates', 'security', 'ERROR'),
+            ErrorPattern('openssl_ssl_error', r'OpenSSL::SSL::SSLError', 'SSL/Certificates', 'security', 'ERROR'),
+            
+            # Additional Kubernetes patterns
+            ErrorPattern('k8s_admission_denied', r'admission\s+webhook.*denied', 'Kubernetes/Helm', 'admission', 'ERROR'),
+            ErrorPattern('k8s_admission_timeout', r'admission\s+webhook.*(?:timeout|deadline)', 'Kubernetes/Helm', 'admission', 'ERROR'),
+            ErrorPattern('k8s_affinity_violation', r'(?:affinity|anti-affinity)\s+(?:violation|not\s+satisfied)', 'Kubernetes/Helm', 'scheduler', 'ERROR'),
+            ErrorPattern('k8s_agent_connection_failed', r'(?:gitlab-agent|agentk|kas).*connection.*(?:failed|refused|error)', 'Kubernetes/Helm', 'agent', 'ERROR'),
+            ErrorPattern('k8s_agent_error', r'(?:gitlab-agent|agentk).*error', 'Kubernetes/Helm', 'agent', 'ERROR'),
+            ErrorPattern('k8s_agent_grpc_error', r'(?:gitlab-agent|agentk).*grpc.*(?:error|failed)', 'Kubernetes/Helm', 'agent', 'ERROR'),
+            ErrorPattern('k8s_agent_timeout', r'(?:gitlab-agent|agentk).*(?:timeout|deadline)', 'Kubernetes/Helm', 'agent', 'ERROR'),
+            ErrorPattern('k8s_apiserver_connection', r'(?:kube-apiserver|apiserver).*connection.*(?:refused|failed|error)', 'Kubernetes/Helm', 'apiserver', 'CRITICAL'),
+            ErrorPattern('k8s_apiserver_error', r'(?:kube-apiserver|apiserver).*(?:error|failed)', 'Kubernetes/Helm', 'apiserver', 'ERROR'),
+            ErrorPattern('k8s_apiserver_latency', r'(?:kube-apiserver|apiserver).*(?:latency|slow)', 'Kubernetes/Helm', 'apiserver', 'WARNING'),
+            ErrorPattern('k8s_calico_bgp_error', r'calico.*BGP.*(?:error|failed)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_calico_bird_error', r'calico.*BIRD.*(?:error|failed)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_calico_felix_error', r'calico.*felix.*(?:error|failed)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_calico_ip_pool_exhausted', r'calico.*IP\s+(?:address\s+)?pool\s+exhausted', 'Kubernetes/Helm', 'cni', 'CRITICAL'),
+            ErrorPattern('k8s_calico_ipam_error', r'calico.*IPAM.*error', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_calico_node_not_ready', r'calico[^"]*node[^"]*not\s+ready', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_calico_typha_error', r'calico.*typha.*(?:error|failed)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_certmanager_error', r'cert-manager.*(?:error|failed)', 'Kubernetes/Helm', 'certmanager', 'ERROR'),
+            ErrorPattern('k8s_certmanager_issuer_not_ready', r'(?:Cluster)?Issuer.*not\s+ready', 'Kubernetes/Helm', 'certmanager', 'ERROR'),
+            ErrorPattern('k8s_certmanager_renewal_failed', r'certificate.*renewal.*failed', 'Kubernetes/Helm', 'certmanager', 'ERROR'),
+            ErrorPattern('k8s_cilium_error', r'cilium.*(?:error|failed)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_cni_binary_not_found', r'CNI\s+(?:plugin\s+)?binary\s+not\s+found', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_cni_config_error', r'CNI.*config.*(?:error|invalid|not\s+found)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_cni_ip_exhausted', r'CNI.*(?:IP\s+exhausted|no\s+IPs\s+available)', 'Kubernetes/Helm', 'cni', 'CRITICAL'),
+            ErrorPattern('k8s_cni_plugin_error', r'CNI\s+plugin.*(?:error|failed)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_cni_timeout', r'CNI.*(?:timeout|timed\s+out)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_configmap_not_found', r'(?:kubernetes|kubectl|pod|container).*configmap.*not.*found', 'Kubernetes/Helm', 'rbac', 'ERROR'),
+            ErrorPattern('k8s_container_config_error', r'container.*(?:configuration|config).*(?:error|invalid)', 'Kubernetes/Helm', 'container', 'ERROR'),
+            ErrorPattern('k8s_container_create_failed', r'(?:failed|unable)\s+to\s+create\s+container', 'Kubernetes/Helm', 'container', 'ERROR'),
+            ErrorPattern('k8s_container_exit_error', r'container.*exited\s+with\s+(?:error|code\s+[1-9])', 'Kubernetes/Helm', 'container', 'ERROR'),
+            ErrorPattern('k8s_container_kill_failed', r'(?:failed|unable)\s+to\s+kill\s+container', 'Kubernetes/Helm', 'container', 'ERROR'),
+            ErrorPattern('k8s_container_not_found', r'container.*not\s+found', 'Kubernetes/Helm', 'container', 'ERROR'),
+            ErrorPattern('k8s_container_restart_failed', r'container.*restart.*failed', 'Kubernetes/Helm', 'container', 'ERROR'),
+            ErrorPattern('k8s_container_start_failed', r'(?:failed|unable)\s+to\s+start\s+container', 'Kubernetes/Helm', 'container', 'ERROR'),
+            ErrorPattern('k8s_cronjob_deadline', r'CronJob.*(?:deadline|missed)', 'Kubernetes/Helm', 'job', 'WARNING'),
+            ErrorPattern('k8s_cronjob_failed', r'CronJob.*(?:failed|error)', 'Kubernetes/Helm', 'job', 'ERROR'),
+            ErrorPattern('k8s_csi_driver_error', r'CSI.*driver.*(?:error|failed)', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_deployment_conflict', r'deployment.*(?:conflict|already\s+exists)', 'Kubernetes/Helm', 'deployment', 'ERROR'),
+            ErrorPattern('k8s_deployment_failed', r'deployment.*(?:failed|error)', 'Kubernetes/Helm', 'deployment', 'ERROR'),
+            ErrorPattern('k8s_deployment_rollback', r'deployment.*(?:rollback|rolled\s+back)', 'Kubernetes/Helm', 'deployment', 'WARNING'),
+            ErrorPattern('k8s_endpoint_not_ready', r'endpoint.*not.*ready', 'Kubernetes/Helm', 'service', 'WARNING'),
+            ErrorPattern('k8s_etcd_connection', r'etcd.*connection.*(?:refused|failed|error)', 'Kubernetes/Helm', 'etcd', 'CRITICAL'),
+            ErrorPattern('k8s_etcd_error', r'etcd.*(?:error|failed)', 'Kubernetes/Helm', 'etcd', 'ERROR'),
+            ErrorPattern('k8s_flannel_error', r'flannel.*(?:error|failed)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_forbidden', r'(?:pods|services|deployments|namespaces).*is.*forbidden', 'Kubernetes/Helm', 'rbac', 'ERROR'),
+            ErrorPattern('k8s_gitaly_cluster_error', r'gitaly.*cluster.*(?:error|failed)', 'Kubernetes/Helm', 'gitaly', 'ERROR'),
+            ErrorPattern('k8s_gitaly_pod_crashloop', r'gitaly.*(?:CrashLoopBackOff|crash)', 'Kubernetes/Helm', 'gitaly', 'CRITICAL'),
+            ErrorPattern('k8s_gitaly_pvc_error', r'gitaly.*(?:pvc|persistent).*(?:error|failed|pending)', 'Kubernetes/Helm', 'gitaly', 'ERROR'),
+            ErrorPattern('k8s_gitaly_sidecar_error', r'gitaly.*sidecar.*(?:error|failed)', 'Kubernetes/Helm', 'gitaly', 'ERROR'),
+            ErrorPattern('k8s_hpa_error', r'HorizontalPodAutoscaler.*(?:error|failed)', 'Kubernetes/Helm', 'hpa', 'ERROR'),
+            ErrorPattern('k8s_hpa_scale_failed', r'HPA.*(?:scale|scaling).*failed', 'Kubernetes/Helm', 'hpa', 'ERROR'),
+            ErrorPattern('k8s_ingress_502', r'ingress.*502\s+Bad\s+Gateway', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_503', r'ingress.*503\s+Service\s+Unavailable', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_504', r'ingress.*504\s+Gateway\s+Timeout', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_backend_error', r'ingress.*backend.*(?:error|failed|unavailable)', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_cert_error', r'ingress.*certificate.*(?:error|invalid|expired)', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_class_not_found', r'ingress\s+class\s+.*not\s+found', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_controller_error', r'ingress.*controller.*error', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_controller_not_ready', r'ingress-nginx-controller.*not\s+ready', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_loadbalancer_pending', r'ingress.*LoadBalancer.*Pending', 'Kubernetes/Helm', 'ingress', 'WARNING'),
+            ErrorPattern('k8s_ingress_no_endpoints', r'ingress.*no\s+endpoints\s+available', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_ssl_error', r'ingress.*SSL.*(?:error|failed)', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_ingress_tls_secret_not_found', r'(?:ingress|TLS).*secret.*not\s+found', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_job_deadline', r'Job.*DeadlineExceeded', 'Kubernetes/Helm', 'job', 'ERROR'),
+            ErrorPattern('k8s_job_failed', r'Job.*(?:failed|error)', 'Kubernetes/Helm', 'job', 'ERROR'),
+            ErrorPattern('k8s_kubectl_apply_error', r'kubectl.*apply.*(?:error|failed)', 'Kubernetes/Helm', 'kubectl', 'ERROR'),
+            ErrorPattern('k8s_kubectl_error', r'kubectl.*(?:error|failed)', 'Kubernetes/Helm', 'kubectl', 'ERROR'),
+            ErrorPattern('k8s_kubectl_timeout', r'kubectl.*(?:timeout|timed\s+out)', 'Kubernetes/Helm', 'kubectl', 'ERROR'),
+            ErrorPattern('k8s_kubelet_eviction', r'kubelet.*evict', 'Kubernetes/Helm', 'kubelet', 'WARNING'),
+            ErrorPattern('k8s_kubelet_node_not_ready', r'kubelet.*node.*not\s+ready', 'Kubernetes/Helm', 'kubelet', 'CRITICAL'),
+            ErrorPattern('k8s_kubelet_oom', r'kubelet.*(?:OOM|Out\s+of\s+memory)', 'Kubernetes/Helm', 'kubelet', 'CRITICAL'),
+            ErrorPattern('k8s_kubelet_sync_error', r'kubelet.*sync.*(?:error|failed)', 'Kubernetes/Helm', 'kubelet', 'ERROR'),
+            ErrorPattern('k8s_liveness_connection_refused', r'Liveness\s+probe.*connection\s+refused', 'Kubernetes/Helm', 'healthcheck', 'ERROR'),
+            ErrorPattern('k8s_liveness_failed', r'Liveness\s+probe\s+failed', 'Kubernetes/Helm', 'healthcheck', 'ERROR'),
+            ErrorPattern('k8s_liveness_timeout', r'Liveness\s+probe.*timeout', 'Kubernetes/Helm', 'healthcheck', 'ERROR'),
+            ErrorPattern('k8s_loadbalancer_failed', r'LoadBalancer.*(?:failed|error)', 'Kubernetes/Helm', 'service', 'ERROR'),
+            ErrorPattern('k8s_mount_device_failed', r'MountDevice.*failed', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_namespace_terminating', r'namespace.*Terminating', 'Kubernetes/Helm', 'namespace', 'WARNING'),
+            ErrorPattern('k8s_netpol_error', r'NetworkPolicy.*(?:error|failed|denied)', 'Kubernetes/Helm', 'network', 'ERROR'),
+            ErrorPattern('k8s_network_not_ready', r'(?:pod|container|node|CNI|cni).*network.*not.*ready', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_network_unavailable', r'(?:pod|container|node|CNI|cni).*network.*unavailable', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_nfs_mount_error', r'NFS.*mount.*(?:error|failed)', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_nginx_ingress_backend_timeout', r'(?:nginx|ingress).*upstream.*timed\s+out', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_nginx_ingress_config_error', r'nginx\s+ingress.*configuration\s+(?:error|invalid)', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_nginx_ingress_reload_fail', r'nginx\s+ingress.*reload\s+failed', 'Kubernetes/Helm', 'ingress', 'ERROR'),
+            ErrorPattern('k8s_no_nodes_available', r'(?:no\s+nodes\s+available|nodes\s+available.*no\s+nodes)', 'Kubernetes/Helm', 'scheduler', 'ERROR'),
+            ErrorPattern('k8s_node_disk_pressure', r'(?:node|Node).*(?:DiskPressure|disk\s+pressure)', 'Kubernetes/Helm', 'node', 'WARNING'),
+            ErrorPattern('k8s_node_memory_pressure', r'(?:node|Node).*(?:MemoryPressure|memory\s+pressure)', 'Kubernetes/Helm', 'node', 'WARNING'),
+            ErrorPattern('k8s_node_not_ready', r'(?:node|Node).*(?:NotReady|not\s+ready)', 'Kubernetes/Helm', 'node', 'CRITICAL'),
+            ErrorPattern('k8s_node_pid_pressure', r'(?:node|Node).*(?:PIDPressure|pid\s+pressure)', 'Kubernetes/Helm', 'node', 'WARNING'),
+            ErrorPattern('k8s_node_selector_mismatch', r'node\s+selector.*(?:mismatch|does\s+not\s+match)', 'Kubernetes/Helm', 'scheduler', 'ERROR'),
+            ErrorPattern('k8s_operator_error', r'operator.*(?:error|failed|reconcile\s+error)', 'Kubernetes/Helm', 'operator', 'ERROR'),
+            ErrorPattern('k8s_operator_reconcile_error', r'operator.*reconcile.*(?:error|failed)', 'Kubernetes/Helm', 'operator', 'ERROR'),
+            ErrorPattern('k8s_permission_denied', r'permission.*denied.*(?:pod|service|deployment)', 'Kubernetes/Helm', 'rbac', 'ERROR'),
+            ErrorPattern('k8s_pv_failed', r'PersistentVolume.*Failed', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_pvc_lost', r'PersistentVolumeClaim.*Lost', 'Kubernetes/Helm', 'storage', 'CRITICAL'),
+            ErrorPattern('k8s_pvc_pending', r'PersistentVolumeClaim.*Pending', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_readiness_failed', r'Readiness\s+probe\s+failed', 'Kubernetes/Helm', 'healthcheck', 'WARNING'),
+            ErrorPattern('k8s_readiness_timeout', r'Readiness\s+probe.*timeout', 'Kubernetes/Helm', 'healthcheck', 'WARNING'),
+            ErrorPattern('k8s_replicaset_failed', r'ReplicaSet.*(?:failed|error)', 'Kubernetes/Helm', 'deployment', 'ERROR'),
+            ErrorPattern('k8s_replicaset_quota', r'ReplicaSet.*(?:quota|exceeded)', 'Kubernetes/Helm', 'deployment', 'ERROR'),
+            ErrorPattern('k8s_runner_container_error', r'gitlab-runner.*container.*(?:error|failed)', 'Kubernetes/Helm', 'runner', 'ERROR'),
+            ErrorPattern('k8s_runner_executor_error', r'gitlab-runner.*executor.*(?:error|failed)', 'Kubernetes/Helm', 'runner', 'ERROR'),
+            ErrorPattern('k8s_runner_job_failed', r'gitlab-runner.*job.*(?:failed|error)', 'Kubernetes/Helm', 'runner', 'ERROR'),
+            ErrorPattern('k8s_runner_pod_creation_failed', r'gitlab-runner.*pod.*(?:creation|create).*failed', 'Kubernetes/Helm', 'runner', 'ERROR'),
+            ErrorPattern('k8s_scheduling_failed', r'[Ff]ailed\s+to\s+schedule\s+pod', 'Kubernetes/Helm', 'scheduler', 'ERROR'),
+            ErrorPattern('k8s_secret_not_found', r'(?:kubernetes|kubectl|pod|container).*secret.*not.*found', 'Kubernetes/Helm', 'rbac', 'ERROR'),
+            ErrorPattern('k8s_service_no_endpoints', r'service\s+has\s+no\s+endpoints', 'Kubernetes/Helm', 'service', 'ERROR'),
+            ErrorPattern('k8s_service_not_found', r'(?:kubernetes|kubectl|kube-proxy|endpoint).*service.*not.*found', 'Kubernetes/Helm', 'service', 'ERROR'),
+            ErrorPattern('k8s_service_unavailable', r'(?:kubernetes|kubectl|kube-proxy|endpoint).*service.*unavailable', 'Kubernetes/Helm', 'service', 'ERROR'),
+            ErrorPattern('k8s_serviceaccount_not_found', r'serviceaccount.*not.*found', 'Kubernetes/Helm', 'rbac', 'ERROR'),
+            ErrorPattern('k8s_startup_probe_failed', r'Startup\s+probe\s+failed', 'Kubernetes/Helm', 'healthcheck', 'ERROR'),
+            ErrorPattern('k8s_storageclass_not_found', r'StorageClass.*not.*found', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_taint_toleration', r'(?:taint|toleration)\s+.*(?:mismatch|not\s+tolerated)', 'Kubernetes/Helm', 'scheduler', 'ERROR'),
+            ErrorPattern('k8s_unauthorized', r'Unauthorized.*(?:user|serviceaccount)', 'Kubernetes/Helm', 'rbac', 'ERROR'),
+            ErrorPattern('k8s_unhealthy', r'Unhealthy.*(?:pod|container)', 'Kubernetes/Helm', 'healthcheck', 'ERROR'),
+            ErrorPattern('k8s_unschedulable', r'(?:pod|Pod).*unschedulable', 'Kubernetes/Helm', 'scheduler', 'ERROR'),
+            ErrorPattern('k8s_volume_attach_failed', r'(?:failed|unable)\s+to\s+attach\s+volume', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_volume_detach_failed', r'(?:failed|unable)\s+to\s+detach\s+volume', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_volume_expansion_failed', r'volume.*expansion.*failed', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_volume_in_use', r'volume.*(?:in\s+use|is\s+already\s+attached)', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_volume_mount_failed', r'(?:failed|unable)\s+to\s+mount\s+volume', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_volume_not_found', r'(?:pod|pvc|pv|kubernetes|kubectl).*volume.*not.*found', 'Kubernetes/Helm', 'storage', 'ERROR'),
+            ErrorPattern('k8s_vpa_error', r'VerticalPodAutoscaler.*(?:error|failed)', 'Kubernetes/Helm', 'vpa', 'ERROR'),
+            ErrorPattern('k8s_weave_error', r'weave.*(?:error|failed)', 'Kubernetes/Helm', 'cni', 'ERROR'),
+            ErrorPattern('k8s_workspace_error', r'workspace.*(?:error|failed)', 'Kubernetes/Helm', 'workspace', 'ERROR'),
+            ErrorPattern('k8s_workspace_pod_failed', r'workspace.*pod.*(?:failed|error)', 'Kubernetes/Helm', 'workspace', 'ERROR'),
+            ErrorPattern('k8s_workspace_timeout', r'workspace.*(?:timeout|deadline)', 'Kubernetes/Helm', 'workspace', 'ERROR'),
+            
+            # Additional Helm patterns  
+            ErrorPattern('helm_chart_not_found', r'(?:helm\s+)?chart\s+not\s+found', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_crd_error', r'helm.*CRD.*(?:error|failed)', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_hook_failed', r'helm.*hook.*failed', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_install_failed', r'INSTALL\s+FAILED', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_invalid_chart', r'helm.*invalid.*chart', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_missing_dependency', r'helm.*missing.*dependency', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_release_failed', r'(?:UPGRADE|INSTALL|ROLLBACK).*FAILED', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_release_not_found', r'(?:helm\s+)?release\s+.*not\s+found', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_release_timeout', r'Error:\s+release\s+\w+\s+failed:\s+timed\s+out', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_resource_conflict', r'helm.*resource.*conflict', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_rollback_failed', r'ROLLBACK\s+FAILED', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_template_error', r'helm.*template.*(?:error|failed)', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_timeout', r'helm.*(?:timeout|timed.*out)', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_upgrade_failed', r'UPGRADE\s+FAILED', 'Kubernetes/Helm', 'helm', 'ERROR'),
+            ErrorPattern('helm_values_error', r'helm.*values.*(?:error|invalid)', 'Kubernetes/Helm', 'helm', 'ERROR'),
+        ]
+        
         # Combine all patterns
         all_patterns = (
             praefect_patterns + postgresql_patterns + redis_patterns +
             sidekiq_patterns + rails_patterns + kubernetes_patterns +
-            ssl_patterns + geo_patterns + other_patterns
+            ssl_patterns + geo_patterns + other_patterns + additional_patterns
         )
         
         self.patterns.extend(all_patterns)
@@ -1852,17 +2079,23 @@ class EnhancedPatternBank:
         cleaned = re.sub(r'[\\^$*+?{}\[\]().|]', ' ', regex_pattern)
         words = cleaned.split()
         
+        # FIXED: Extract both lowercase and original case
         # Filter meaningful words (>3 chars)
-        literals = [w.lower() for w in words if len(w) > 3]
+        for w in words:
+            if len(w) > 3:
+                literals.append(w.lower())  # Add lowercase version
         
-        return literals if literals else [regex_pattern[:20]]
+        return literals if literals else [regex_pattern[:20].lower()]
 
 
 class TurboAutoGrep:
     """Main analyzer with streaming and parallel processing"""
     
+    # CONSTANTS
+    MAX_CONCURRENT_FILES = 32  # Limit concurrent file processing
+    
     def __init__(self, workers: int = None):
-        self.workers = workers or min(mp.cpu_count(), 16)  # Use more cores
+        self.workers = workers or min(mp.cpu_count(), 32)  # Increased from 16 to 32
         self.pattern_bank = EnhancedPatternBank()
         self.results_queue = None
         self.stats = {
@@ -1913,7 +2146,10 @@ class TurboAutoGrep:
             return analyzed_results
     
     async def _process_files_parallel_async(self, files: List[Path]):
-        """Process files in parallel with async/await"""
+        """Process files in parallel with async/await - WITH CONCURRENCY LIMIT"""
+        
+        # CRITICAL FIX: Add semaphore to prevent task explosion
+        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_FILES)
         
         # Create processor pool
         processors = [
@@ -1921,17 +2157,19 @@ class TurboAutoGrep:
             for _ in range(self.workers)
         ]
         
-        # Create tasks
-        tasks = []
-        for i, file_path in enumerate(files):
-            processor = processors[i % self.workers]
-            task = processor.process_file_streaming(
-                file_path, 
-                self.results_queue
-            )
-            tasks.append(task)
+        # Process with concurrency limit
+        async def process_with_limit(file_path: Path, processor_idx: int):
+            async with semaphore:
+                processor = processors[processor_idx % self.workers]
+                return await processor.process_file_streaming(file_path, self.results_queue)
         
-        # Run all tasks concurrently
+        # Create tasks with limit
+        tasks = [
+            process_with_limit(file_path, i) 
+            for i, file_path in enumerate(files)
+        ]
+        
+        # Run all tasks concurrently (but limited by semaphore)
         results = await asyncio.gather(*tasks)
         
         self.stats['files_processed'] = len(files)
@@ -2049,26 +2287,104 @@ class TurboAutoGrep:
         return dict(component_counts)
     
     def _extract_tar(self, tar_path: str, dest: str) -> List[Path]:
-        """Extract tar and return file paths"""
+        """Extract tar and return file paths - WITH SECURITY VALIDATION"""
         files = []
         
-        if tar_path.endswith('.gz'):
+        # Determine compression mode
+        if tar_path.endswith('.tar.gz') or tar_path.endswith('.tgz'):
             mode = 'r:gz'
+        elif tar_path.endswith('.tar.bz2') or tar_path.endswith('.tbz2'):
+            mode = 'r:bz2'
+        elif tar_path.endswith('.tar.xz'):
+            mode = 'r:xz'
         else:
             mode = 'r'
-            
-        with tarfile.open(tar_path, mode) as tar:
-            tar.extractall(dest)
-            
-            for root, _, filenames in os.walk(dest):
-                for filename in filenames:
-                    files.append(Path(root) / filename)
+        
+        try:
+            with tarfile.open(tar_path, mode) as tar:
+                # CRITICAL SECURITY FIX: Validate paths to prevent traversal attacks
+                extracted_count = 0
+                skipped_count = 0
+                
+                for member in tar.getmembers():
+                    # Check for path traversal attempts
+                    if member.name.startswith('/') or '..' in member.name:
+                        print(f"⚠️  Skipping dangerous path: {member.name}")
+                        skipped_count += 1
+                        continue
+                    
+                    # Check for absolute paths
+                    if os.path.isabs(member.name):
+                        print(f"⚠️  Skipping absolute path: {member.name}")
+                        skipped_count += 1
+                        continue
+                    
+                    # Extract safely
+                    try:
+                        tar.extract(member, dest)
+                        extracted_count += 1
+                    except Exception as e:
+                        print(f"⚠️  Failed to extract {member.name}: {e}")
+                        skipped_count += 1
+                        continue
+                
+                print(f"✅ Extracted {extracted_count} files" + 
+                      (f" (skipped {skipped_count})" if skipped_count > 0 else ""))
+                
+                # Now collect extracted files
+                for root, _, filenames in os.walk(dest):
+                    for filename in filenames:
+                        file_path = Path(root) / filename
+                        # Skip hidden files and system files
+                        if not filename.startswith('.'):
+                            files.append(file_path)
+        
+        except tarfile.TarError as e:
+            print(f"❌ Failed to extract tar {tar_path}: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Unexpected error extracting {tar_path}: {e}")
+            raise
         
         return files
 
 
 # Export main class
 AutoGrep = TurboAutoGrep
+
+
+def main():
+    """CLI entry point for testing"""
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python autogrep.py <tar_file>")
+        sys.exit(1)
+    
+    tar_file = sys.argv[1]
+    
+    async def run_analysis():
+        analyzer = TurboAutoGrep()
+        
+        def progress_callback(data):
+            if isinstance(data, dict) and data.get('type') == 'progress':
+                print(f"Progress: {data.get('file', 'unknown')} - {data.get('progress_percent', 0):.1f}%")
+        
+        results = await analyzer.analyze_tar_streaming(tar_file, callback=progress_callback)
+        
+        # Print summary
+        print(f"\n{'='*80}")
+        print(f"📊 ANALYSIS COMPLETE")
+        print(f"{'='*80}")
+        print(f"Total errors found: {results['total_errors']}")
+        print(f"Unique error patterns: {results['unique_patterns']}")
+        print(f"Files processed: {results['summary']['files_processed']}")
+        print(f"Processing time: {results['summary']['end_time'] - results['summary']['start_time']:.2f}s")
+        print(f"\n🔥 Top 10 Errors:")
+        for i, error in enumerate(results['top_errors'][:10], 1):
+            print(f"{i}. [{error['severity']}] {error['component']}: {error['message'][:80]}... (x{error['count']})")
+    
+    asyncio.run(run_analysis())
+
 
 if __name__ == "__main__":
     main()
