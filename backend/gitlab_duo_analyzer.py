@@ -192,8 +192,14 @@ Be specific."""
                 return await self.call_duo_api(content, session_id, attempt + 1)
             return None
     
-    async def analyze_errors_with_batching(self, session_id: str, error_groups: List[Dict]) -> Dict:
-        """Analyze errors individually using REST API - one error at a time for best results"""
+    async def analyze_errors_with_batching(self, session_id: str, error_groups: List[Dict], selected_indices: Optional[List[int]] = None) -> Dict:
+        """Analyze errors individually using REST API - one error at a time for best results
+        
+        Args:
+            session_id: Unique session identifier
+            error_groups: List of all error patterns
+            selected_indices: Optional list of indices to analyze. If None, analyze all.
+        """
         
         # Check for cached results
         existing = self._load_session(session_id)
@@ -207,17 +213,29 @@ Be specific."""
                 'error': 'GitLab Duo not configured. Set GITLAB_TOKEN environment variable.'
             }
         
+        # Filter errors based on selected_indices
+        if selected_indices is not None and len(selected_indices) > 0:
+            # Only analyze selected error patterns
+            errors_to_analyze = [error_groups[i] for i in selected_indices if i < len(error_groups)]
+            print(f"🎯 Selective analysis: {len(errors_to_analyze)} of {len(error_groups)} patterns selected")
+        else:
+            # Analyze all errors
+            errors_to_analyze = error_groups
+            print(f"📊 Full analysis: analyzing all {len(error_groups)} patterns")
+        
         # Initialize session
         session_data = {
             'status': 'processing',
             'session_id': session_id,
             'started_at': datetime.now().isoformat(),
-            'total_errors': sum(e.get('count', 0) for e in error_groups),
-            'unique_patterns': len(error_groups),
-            'patterns_total': len(error_groups),
+            'total_errors': sum(e.get('count', 0) for e in errors_to_analyze),
+            'unique_patterns': len(errors_to_analyze),
+            'patterns_total': len(errors_to_analyze),
             'patterns_analyzed': 0,
             'current_message': 'Starting analysis...',
-            'analyses': []  # Store individual analyses
+            'analyses': [],  # Store individual analyses
+            'selected_indices': selected_indices,  # Track which indices were selected
+            'total_available_patterns': len(error_groups)  # Track total available
         }
         
         try:
@@ -225,21 +243,23 @@ Be specific."""
             print(f"🚀 GITLAB DUO AI ANALYSIS")
             print(f"📊 Total errors: {session_data['total_errors']}")
             print(f"📋 Analyzing {session_data['unique_patterns']} error patterns individually")
+            if selected_indices:
+                print(f"🎯 Selected patterns: {selected_indices}")
             print(f"{'='*60}\n")
             
             # Save initial state
             self._save_session(session_id, session_data)
             
-            # Analyze each error pattern individually
-            for idx, error in enumerate(error_groups, 1):
-                print(f"� Analyzing Pattern {idx}/{len(error_groups)}")
+            # Analyze each selected error pattern individually
+            for idx, error in enumerate(errors_to_analyze, 1):
+                print(f"🔍 Analyzing Pattern {idx}/{len(errors_to_analyze)}")
                 
-                session_data['current_message'] = f"Analyzing pattern {idx}/{len(error_groups)}..."
+                session_data['current_message'] = f"Analyzing pattern {idx}/{len(errors_to_analyze)}..."
                 session_data['patterns_analyzed'] = idx - 1
                 self._save_session(session_id, session_data)
                 
                 # Prepare detailed prompt for this specific error
-                prompt = self._prepare_individual_error_prompt(error, idx, len(error_groups))
+                prompt = self._prepare_individual_error_prompt(error, idx, len(errors_to_analyze))
                 
                 # Call API
                 result = await self.call_duo_api(prompt, f"{session_id}_pattern_{idx}")
@@ -278,10 +298,10 @@ Be specific."""
                     })
                 
                 # Small delay between calls to avoid rate limiting
-                if idx < len(error_groups):
+                if idx < len(errors_to_analyze):
                     await asyncio.sleep(0.5)
             
-            session_data['patterns_analyzed'] = len(error_groups)
+            session_data['patterns_analyzed'] = len(errors_to_analyze)
             
             # Mark as completed
             session_data.update({
@@ -289,7 +309,7 @@ Be specific."""
                 'completed_at': datetime.now().isoformat(),
                 'current_message': 'Analysis completed successfully!',
                 'summary': {
-                    'total_patterns': len(error_groups),
+                    'total_patterns': len(errors_to_analyze),
                     'successful_analyses': len([a for a in session_data['analyses'] if not a.get('failed', False)]),
                     'failed_analyses': len([a for a in session_data['analyses'] if a.get('failed', False)])
                 }
@@ -300,7 +320,7 @@ Be specific."""
             
             print(f"\n{'='*60}")
             print(f"✅ Analysis complete!")
-            print(f"   Patterns analyzed: {session_data['summary']['successful_analyses']}/{len(error_groups)}")
+            print(f"   Patterns analyzed: {session_data['summary']['successful_analyses']}/{len(errors_to_analyze)}")
             print(f"{'='*60}\n")
             
             return session_data
