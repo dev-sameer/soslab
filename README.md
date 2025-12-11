@@ -1,50 +1,156 @@
-# 🚀 GitLab SOS Analyzer
+# 🚀 SOS Lab - Static Log Analysis for GitLab Troubleshooting
 
-AI-powered log analyzer with advanced search features for GitLab SOS archives.
+**Simple, focused, powerful log analysis tool for GitLab infrastructure troubleshooting.**
 
-![image](https://gitlab.com/uploads/-/system/personal_snippet/4885492/c1809191e6223af9dc1e44a91c07dbd2/soslab.png)
+AI-powered log analyzer with advanced search, pattern clustering, and correlation tracing for GitLab SOS archives and custom logs.
+
+<img width="1728" height="915" alt="Screenshot 2025-12-11 at 9 36 33 AM" src="https://github.com/user-attachments/assets/0e1026c6-9d0f-4ffc-9507-f39fda9e6247" />
+<img width="1728" height="906" alt="Screenshot 2025-12-11 at 9 35 24 AM" src="https://github.com/user-attachments/assets/87d76a2c-9220-495c-9cb3-c2184150f5e4" />
+
+
 
 ---
 
 ## 📋 Quick Navigation
 
-- 🎬 [Demo Video](#demo-video)
 - 🚀 [Getting Started](#getting-started-the-easy-way)
 - 📦 [Prerequisites](#before-you-start)
-- 💡 [Key Features](#what-makes-this-special)
+- 💡 [Why SOS Lab?](#why-sos-lab)
+- ✨ [Key Features](#key-features)
 - 📈 [System Metrics Dashboard](#system-metrics-dashboard)
 - 🔍 [PowerSearch Guide](#powersearch---search-like-a-human)
+- 📊 [Log Aggregation](#log-aggregation---pattern-clustering)
+- 🔗 [Log Tracer](#log-tracer---correlation-timeline)
 - 🤖 [AI Integration](#ai-integration)
 - 📊 [Using the Analyzer](#using-the-analyzer)
 
+---
+
+## Why SOS Lab?
+
+### The Problem
+
+In high-availability GitLab setups with many nodes, troubleshooting is painful:
+- Collecting logs from 30+ nodes results in massive SOS bundles
+- Manually navigating through thousands of log files is time-consuming and error-prone
+- Enterprise solutions like Elasticsearch and Kibana are overkill for static log analysis and introduce significant operational overhead
+- These streaming platforms are designed for real-time log ingestion, not post-incident analysis or quick log dives
+
+### The Solution
+
+SOS Lab fills this gap by providing a **simple, focused tool for analyzing collected static logs** without the complexity and overhead of full-featured log platforms. It's designed specifically for GitLab troubleshooting workflows but can be extended to prett much any log file analysis
+
+### Key Benefits
+
+- **No infrastructure overhead** - runs locally or on modest hardware
+- **Fast pattern detection** - 10,000 logs become 20-30 patterns instantly
+- **Multi-node support** - analyze logs from 30+ nodes in one place
+- **Flexible sessions** - add/remove files without re-uploading
+- **Cost-effective** - no streaming costs, no vendor lock-in
+- **Built for GitLab** - understands GitLab logs, services, and workflows
 
 ---
 
-## What Makes This Special?
+## Key Features
 
-**Smart Log Analysis**
-- Clean, intuitive interface for viewing SOS archives
-- Drag & drop/upload multiple archives - each gets its own tab that you can rename by double-clicking
-- PowerSearch: search logs usin easy queries
-- Visual query builder for complex search queries
-- Switch between traditional log view and structured table format and raw json view
-- Log viewer with inline search and filter options for quick search
+### 1. **Adding or Removing Files in Sessions**
+
+<img width="982" height="738" alt="Screenshot 2025-12-10 at 1 36 31 PM" src="https://github.com/user-attachments/assets/9cdf23d5-dc09-4afd-9968-2a6d022f958e" />
 
 
-**Auto Analysis**
-- Auto-analysis that scans for GitLab hundreds of error patterns (takes a few minutes to run, but you can navigate other tabs or chat with Duo while it works)
-- Embedded GitLab Duo Chat for interactive log analysis
-- MCP server integration - your VS Code Duo Chat gets superpowers for SOS analysis
-- Hundreds of pre-configured GitLab error patterns from docs and codebase
-- Built-in fast stats - no more switching to terminal
+SOSLab sessions are no longer static. Dynamically manage log files within a session:
+- **Add new files** to an existing session without re-uploading the entire SOS bundle
+- **Remove unnecessary files** to focus on relevant logs
+- **Customize sessions** on the fly based on your investigation needs
+- Perfect for iterative troubleshooting where you discover new log files to analyze
+
+### 2. **Custom Sessions**
+
+<img width="1728" height="909" alt="Screenshot 2025-12-10 at 1 40 25 PM" src="https://github.com/user-attachments/assets/9f2e8083-e77d-4c23-9b5d-2b20d7d54785" />
+
+
+Not all troubleshooting involves full SOS bundles. Create flexible sessions:
+- **Create empty custom sessions** and add only the log files you need
+- **Collect specific logs** like `gitlab-ctl tail` output, application logs, or system logs
+- **Work with any log type** - JSON, syslog, plain text, or mixed formats
+- **No SOS bundle required** - use SOS Lab for any static log analysis scenario
+- Enables the tool to be a general-purpose log analysis platform, not just for SOS bundles
+
+### 3. **Log Aggregation (Pattern Clustering)**
+
+<img width="1728" height="999" alt="Screenshot 2025-12-10 at 1 49 32 PM" src="https://github.com/user-attachments/assets/617c616f-a5bd-4e3e-a4f1-40e2564f7272" />
+
+
+One of the most powerful features for handling large log volumes:
+- **Automatic pattern detection** - groups similar log entries into patterns using Drain clustering
+- **Reduces noise** - 10,000 error logs become 20-30 distinct patterns
+- **Complete overview at a glance** - understand what's happening across all sessions instantly
+- **Handles recurring log types** - identifies that most errors are variations of a few root causes
+- **Multi-session support** - aggregate logs across all 30 nodes to see the big picture
+
+### 4. **Log Tracer (Correlation ID Timeline)**
+
+
+
+Trace request flows across different log types and services:
+- **Search by correlation ID** - similar to Kibana's correlation dashboard
+- **Chronological ordering** - automatically detects timestamps across different log formats (JSON, syslog, etc.)
+- **Handles mixed log types** - GitLab uses multiple log formats with inconsistent timestamp structures; the tracer normalizes them
+- **Timeline visualization** - see the exact sequence of events across services
+- **LLM-friendly output** - copy and paste results directly to AI models for analysis while troubleshooting
+
+### 5. **Troubleshooting Slate**
+
+
+
+A lightweight sticky notes feature for quick note-taking:
+- **Store correlation IDs, error codes, or observations** without leaving the app
+- **Persistent storage** - notes remain until you explicitly clear them
+- **Draggable, resizable, and minimizable** - customize the workspace to your needs
+- **Quick reference** - keep important information visible while analyzing logs
+
+### 6. **Terminal Integration**
+
+<img width="1728" height="1002" alt="Screenshot 2025-12-10 at 1 57 58 PM" src="https://github.com/user-attachments/assets/0142793e-46fe-4ef3-9718-58d68709c8ac" />
+
+
+Full terminal access without leaving the application:
+- **In-app terminal** - tinker, run commands, or troubleshoot via the command line
+- **Full shell functionality** - execute scripts, grep logs, or run diagnostic tools
+- **Seamless workflow** - no context switching between the UI and terminal
+- **Custom experience** - combine UI analysis with command-line power
+
+### 7. **Smart Log Analysis**
+
+Clean, intuitive interface for viewing SOS archives:
+- **Drag & drop/upload** multiple archives - each gets its own tab that you can rename by double-clicking
+- **PowerSearch** - search logs using easy, human-readable queries
+- **Visual query builder** - for complex search queries
+- **Multiple view modes** - switch between traditional log view, structured table format, and raw JSON view
+- **Inline search and filter** - quick search options for rapid exploration
+
+### 8. **Auto-Analysis with GitLab Duo**
+
+AI-powered analysis of error patterns:
+- **Selective analysis** - choose which error patterns to analyze
+- **Detailed insights** - get AI-generated explanations for each pattern
+- **Single-session focus** - excellent for deep-dive analysis of specific issues
+- **Hundreds of pre-configured patterns** - from GitLab docs and codebase
+- **Embedded Duo Chat** - interactive log analysis without leaving the app
+- **MCP server integration** - your VS Code Duo Chat gets superpowers for SOS analysis
+
+### 9. **System Metrics Dashboard**
+
+Get instant visibility into system health across all your nodes:
+- **Parsed metrics view** - load average, CPU usage, memory, disk space at a glance
+- **Process monitoring** - top CPU and memory consuming processes
+- **Critical alerts** - automatic highlighting of zombies, high resource usage, disk space issues
+- **Raw logs view** - access original command output for detailed analysis
+- **31+ system commands** - top, vmstat, free, df, uptime, and more
 
 
 
 ---
-
-## Demo Video
-
-![soslab-demo](https://gitlab.com/uploads/-/system/personal_snippet/4885492/d1cb85a526e73bbb7be62de1fb3232d9/soslab-low.gif)
 
 
 ## Before You Start
@@ -144,7 +250,7 @@ Starting Services:
 
 ### PowerSearch - Search Like a Human
 
-No need to learn complex query languages. Just search naturally using boolean operators 
+No need to learn complex query languages. Just search naturally using boolean operators and field-based filtering. 
 
 #### Query Syntax Examples:
 
@@ -217,6 +323,53 @@ NOT level:debug
 - **📊 Table View**: Structured data in sortable columns
 - **🔍 Search Results**: Filtered entries with highlighting
 - **🌙 Dark Mode**: Easy on the eyes 
+
+---
+
+## Log Aggregation - Pattern Clustering
+
+One of the most powerful features for handling large log volumes. Instead of manually reviewing thousands of logs, SOS Lab automatically groups similar entries into patterns:
+
+**How it works:**
+- Analyzes all logs across all sessions
+- Groups similar entries into patterns using intelligent clustering (Drain algorithm)
+- Extracts common templates from recurring logs
+- Shows you the top patterns by frequency
+
+**Example:**
+- Input: 10,000 error logs from 30 nodes
+- Output: 20-30 distinct patterns with counts
+- Benefit: Instantly see what's actually happening instead of drowning in noise
+
+**Perfect for:**
+- Multi-node troubleshooting
+- Understanding error distribution
+- Identifying systemic issues
+- Getting a complete overview at a glance
+
+---
+
+## Log Tracer - Correlation Timeline
+
+Trace request flows across different log types and services using correlation IDs:
+
+**How it works:**
+- Search for a correlation ID
+- Automatically detects timestamps across different log formats (JSON, syslog, etc.)
+- Normalizes timestamps from inconsistent formats
+- Shows results in chronological order
+
+**Why it's different from grep:**
+- Normal grep shows results as it finds them (not chronological)
+- GitLab uses multiple log formats with inconsistent timestamps
+- Log Tracer normalizes and orders them by actual time
+- Perfect for understanding the sequence of events
+
+**Perfect for:**
+- Following a request through multiple services
+- Understanding the timeline of an incident
+- Feeding results to LLMs for analysis
+- Correlating events across different log types
 
 ---
 
